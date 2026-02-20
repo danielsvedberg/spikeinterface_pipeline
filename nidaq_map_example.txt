@@ -1,0 +1,20 @@
+dinmap = {
+    'licks': 0,
+    'timing_pulse': 1,
+    'solenoid': 2,
+    'tone': 3
+}
+ainmap = {
+    'photometry': 0,
+    'accelerometer_x': 1,
+    'accelerometer_y': 2,
+    'accelerometer_z': 3,
+    'snc': 4,
+    'chrimson': 5,
+    'chr2': 6
+}
+
+optoidx = {
+    'chrimson': [100,200,300,400,500,600],
+    'chr2': [100,200,300,400,500,600]
+}

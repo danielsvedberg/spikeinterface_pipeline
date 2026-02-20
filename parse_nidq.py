@@ -120,8 +120,6 @@ def parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_sup
     mididx = len(tone_times) // 2
     tone_onsets = tone_times[:mididx]
     tone_offsets = tone_times[mididx:]
-    if len(tone_onsets) != len(tone_offsets):
-        raise ValueError("Number of tone onsets does not match number of tone offsets")
 
     return parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support)
 
@@ -149,7 +147,7 @@ def parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support, verbos
     inter_offset_intervals = np.append(inter_offset_intervals, np.inf)
 
     #keep only tone onsets preceded by an interval of at least 0.001 seconds, and keep only tone offsets followed by an interval of at least 0.01
-    min_isi = 0.01  # minimum inter-stimulus interval in seconds
+    min_isi = 0.009  # minimum inter-stimulus interval in seconds
     valid_onset_intervals = inter_onset_intervals >= min_isi
     valid_offset_intervals = inter_offset_intervals >= min_isi
     valid_tone_onsets = tone_onsets[valid_onset_intervals]
@@ -413,7 +411,6 @@ def get_opto_edges(trace, time_array, powers, plot=False):
     n_powers = len(powers)
     max_power = max(powers)
     lower_cutoff = 500#np.mean(trace) * 2
-    print('bing')
     #scaling_factor = (max_trace - mean_trace) ** 0.66
     #lower_cutoff = (scaling_factor * (min_power**0.25))/2 + np.mean(trace)
     filtered_trace = trace[trace >= lower_cutoff]
