@@ -928,7 +928,7 @@ def plot_stim_firing_bars(ephys_data, bs, save_folder=None, alpha=0.05,
     Saves SVG + PNG under save_folder/stim_firing_plots_v2/.
     """
     import re
-    import plot_size_utils as psu
+    from utils import plot_size_utils as psu
 
     opsins = ['chrimson', 'chr2']
     _CMAPS  = {'chrimson': plt.cm.Oranges, 'chr2': plt.cm.Blues}
@@ -1424,7 +1424,7 @@ def plot_ttfs_cdf_single(ephys_data, bs, save_folder=None, max_latency_ms=100):
     import re
     import pandas as pd
     from lifelines import KaplanMeierFitter
-    import plot_size_utils as psu
+    from utils import plot_size_utils as psu
 
     if save_folder is None:
         save_folder = Path.cwd()

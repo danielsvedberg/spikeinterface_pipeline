@@ -5,7 +5,9 @@ from postprocessing import parse_opto_tagging as pot
 
 #base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_050526")
 #base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260506")
-base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260511")
+#base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260511")
+base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS15\DS15_20260702")
+
 pynapple_folder = base_folder / "pynapple"
 ephys_file = pynapple_folder / "spikes.npz"
 binary_signals = pynapple_folder / "binary_signals.npz"

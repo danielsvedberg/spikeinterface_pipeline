@@ -1077,5 +1077,6 @@ def test():
     test_mode=False
     overwrite=True
     plot=True
-    base_folder = str(r'C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250824')
+    plot_save_folder = None
+    base_folder = Path(r'C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250824')
     tsg = get_binary_signals(base_folder,dinmap,ainmap,optoidx,overwrite,plot,test_mode)

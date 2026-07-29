@@ -4,10 +4,12 @@ from spikeinterface.extractors import read_split_intan_files
 from utils.ucla128dn_probe.ucla128DN import get_probe
 import spikeinterface.preprocessing as spre
 import spikeinterface.curation as sic
+import spikeinterface.sorters as se
+import pynapple as nap
 
 probe = get_probe()
 
-base_folder = Path(r"C:\Users\assad\Documents\recording_files\LF_intan_test")
+base_folder = Path(r"C:\Users\assad\Documents\recording_files\Neptun\Neptun_20260626")
 
 def find_rhd_folder(base_folder):
     rhd_folders = [f for f in Path(base_folder).rglob("*") if f.is_dir() and any(f.glob("*.rhd"))]
@@ -20,7 +22,11 @@ rhd_folder = find_rhd_folder(base_folder)
 ephys = read_split_intan_files(rhd_folder, stream_name='RHD2000 amplifier channel')
 ephys = spre.unsigned_to_signed(ephys)
 aux_in = read_split_intan_files(rhd_folder, stream_name='RHD2000 auxiliary input channel')
+adc_in = read_split_intan_files(rhd_folder, stream_name='USB board ADC input channel')
 dig_in = read_split_intan_files(rhd_folder, stream_name='USB board digital input channel')
+fs = dig_in.sampling_frequency
+dig_in = dig_in.get_traces()
+adc_in = adc_in.get_traces()
 
 ephys = ephys.set_probe(probe)
 
@@ -35,7 +41,7 @@ bad_chids = chids[bad_chans]
 
 my_protocol = {
     'preprocessing': {
-        #'notch_filter': {'freq': 60, 'q': 300},
+        'notch_filter': {'freq': 60, 'q': 300},
         'bandpass_filter': {},
         'detect_and_remove_bad_channels': {'bad_channel_ids': bad_chids},
         #'phase_shift': {},
@@ -83,6 +89,9 @@ job_kwargs = dict(n_jobs=23, progress_bar=True)
 analyzer.compute(my_protocol['postprocessing'], **job_kwargs)
 analyzer = si.load_sorting_analyzer(folder=base_folder / 'analyzer')
 
+from spikeinterface_gui import run_mainwindow
+# open and run the Qt app
+run_mainwindow(analyzer, mode="desktop", curation=True)
 
 si.export_report(sorting_analyzer=analyzer, output_folder=base_folder / 'sorting_summary_raw', remove_if_exists=True)
 template_diff_thresh = [0.05, 0.1]

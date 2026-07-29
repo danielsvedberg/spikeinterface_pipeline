@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 from probeinterface import Probe
 
-HERE = Path('utils') / 'ucla128dn_probe'
+HERE = Path(__file__).parent
 
 
 def _load_matlab_matrix(path):

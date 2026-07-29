@@ -72,10 +72,22 @@ def run_pipeline(base_folder, nidaq_map=None, bad_chans=None, export_raw_summary
     }
 
 
-    preprocessed_rec = si.apply_preprocessing_pipeline(raw_rec, my_protocol['preprocessing'], n_jobs=-1, progress_bar=True)
-    preprocessed_rec.save(folder=base_folder / 'preprocess', format='binary', n_jobs=-1, progress_bar=True, overwrite=True)
-    #preprocessed_rec = si.load(base_folder / 'preprocess')
-    sorting = si.run_sorter(recording=preprocessed_rec, **my_protocol['sorting'])
+    ow=False
+    preprocess_folder = base_folder / 'preprocess'
+    if not preprocess_folder.is_dir():
+        ow = True
+
+    if not ow:
+        try:
+            preprocessed_rec = si.load(preprocess_folder)
+        except Exception:
+            ow = True
+
+    if ow:
+        preprocessed_rec = si.apply_preprocessing_pipeline(raw_rec, my_protocol['preprocessing'])
+        preprocessed_rec.save(folder=preprocess_folder, format='binary', n_jobs=-1, progress_bar=True)
+
+    sorting = si.run_sorter(recording=preprocessed_rec, **my_protocol['sorting'], n_jobs=-1)
 
     #sorting = si.load(base_folder / 'kilosort4_output' )
     #preprocessed_rec = si.load(base_folder / 'preprocess')
@@ -166,6 +178,7 @@ def run_pipeline(base_folder, nidaq_map=None, bad_chans=None, export_raw_summary
     plot_time_to_first_spike(base_folder)
     plot_tuning_curves(base_folder)
 
+
 def parse_nidq_kwargs(nidq_map_kwargs):
     if nidq_map_kwargs is not None:
         dinmap = nidq_map_kwargs.get('dinmap', None)
@@ -202,7 +215,8 @@ def plot_tuning_curves(base_folder, overwrite=False, nidq_map_kwargs=None):
 def plot_opto_psth(base_folder, overwrite=False, nidq_map_kwargs=None):
     ephys_data, bs, pynapple_folder = get_pynapple_data(base_folder, nidq_map_kwargs, overwrite)
     pp.plot_all_opto_psth(ephys_data, bs, pynapple_folder)
-
+    analyzer = si.load_sorting_analyzer(folder=base_folder / 'analyzer_clean')
+    pp.plot_all_opto_psth_alt(ephys_data, bs, pynapple_folder, analyzer=analyzer, minmax=(-0.1, 0.2))
 
 def plot_time_to_first_spike(base_folder, overwrite=False, nidq_map_kwargs=None):
     """Convenience wrapper: load pynapple data and call the TTFS plotting function."""

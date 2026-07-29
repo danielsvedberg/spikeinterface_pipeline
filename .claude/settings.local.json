@@ -6,7 +6,18 @@
       "PowerShell(conda env list 2>&1)",
       "PowerShell(Get-ChildItem \"$env:USERPROFILE\\\\miniconda3\\\\envs\", \"$env:USERPROFILE\\\\anaconda3\\\\envs\", \"C:\\\\ProgramData\\\\miniconda3\\\\envs\", \"C:\\\\ProgramData\\\\anaconda3\\\\envs\" -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq \"si_env\" } | Select-Object FullName)",
       "Read(//mnt/c/Users/assad/Documents/codevault/**)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(sed 's/.*def //')",
+      "Bash(sed 's/\\(.*$//')",
+      "Bash(python *)",
+      "Bash(C:/Users/assad/miniconda3/envs/si_env/python.exe \"C:/Users/assad/AppData/Local/Temp/claude/C--Users-assad-Documents-codevault-spikeinterface-pipeline/e3b3f12b-c7be-4891-96d4-134ecd5d3c12/scratchpad/run_meta.py\")",
+      "Bash(C:/Users/assad/miniconda3/envs/si_env/python.exe \"C:/Users/assad/AppData/Local/Temp/claude/C--Users-assad-Documents-codevault-spikeinterface-pipeline/e3b3f12b-c7be-4891-96d4-134ecd5d3c12/scratchpad/inspect_adc2.py\")",
+      "Bash(C:/Users/assad/miniconda3/envs/si_env/python.exe \"C:/Users/assad/AppData/Local/Temp/claude/C--Users-assad-Documents-codevault-spikeinterface-pipeline/e3b3f12b-c7be-4891-96d4-134ecd5d3c12/scratchpad/inspect_powers.py\")",
+      "Bash(C:/Users/assad/miniconda3/envs/si_env/python.exe \"C:/Users/assad/AppData/Local/Temp/claude/C--Users-assad-Documents-codevault-spikeinterface-pipeline/e3b3f12b-c7be-4891-96d4-134ecd5d3c12/scratchpad/inspect_durations.py\")",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(grep -iE '\\\\.txt$|example')"
     ]
   }
 }

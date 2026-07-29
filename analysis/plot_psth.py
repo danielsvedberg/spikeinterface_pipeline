@@ -618,7 +618,7 @@ def plot_opto_psth_single_unit_alt(timestamps, opsin_data, unitID,
 
     Panel width 0.8 in; spacing ws=hs=0.1.
     """
-    import plot_size_utils as psu
+    from utils import plot_size_utils as psu
     from lifelines import KaplanMeierFitter
 
     opsins   = list(opsin_data.keys())

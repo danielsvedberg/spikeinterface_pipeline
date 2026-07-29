@@ -6,7 +6,8 @@ from pathlib import Path
 
 #base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_050526")
     #r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260506")
-base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260511")
+#base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260511")
+base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS15\DS15_20260702")
 pynapple_folder = base_folder / "pynapple" #Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260511\pynapple")
 
 ephys_data, bin_sigs, _ = sip.get_pynapple_data(base_folder, overwrite=False)
