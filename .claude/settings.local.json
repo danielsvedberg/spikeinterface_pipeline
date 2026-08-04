@@ -17,7 +17,14 @@
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(git push *)",
-      "Bash(grep -iE '\\\\.txt$|example')"
+      "Bash(grep -iE '\\\\.txt$|example')",
+      "Read(//mnt/d/experiment_data/recording_files/**)",
+      "Read(//d/experiment_data/recording_files/DS2/**)",
+      "Bash(rm -rf __TRACKED_VAR__/maptest)",
+      "Bash(mkdir -p __TRACKED_VAR__/maptest)",
+      "Read(//c/Users/assad/Desktop/experiment_data/recording_files/DS48/DS48_20260729/**)",
+      "Read(//c/Users/assad/Desktop/experiment_data/recording_files/DS48/**)",
+      "Read(//c/Users/assad/Documents/recording_files/**)"
     ]
   }
 }

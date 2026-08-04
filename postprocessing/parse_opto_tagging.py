@@ -7,6 +7,7 @@ matplotlib.use('Qt5Agg')
 from joblib import Parallel, delayed
 from tqdm import tqdm
 import numpy as np
+from utils import file_structure as fs
 
 def plot_corellograms(ephys_data, bs, opto_events_idx, opto_tagging_folder):
     power_levels = opto_events_idx['power'].unique().tolist()
@@ -494,10 +495,8 @@ def plot_all_tuning_curves(ephys_data, bs, save_folder=None, overwrite=True, njo
     return metadata
 
 def test():
-    #base_folder = Path("C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250822")
-    base_folder = Path("C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250905")
-    #base_folder = Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250824")
-    pynapple_folder = base_folder / "pynapple"
+    base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS13\DS13_20250905")
+    pynapple_folder = fs.SessionPaths(base_folder).pynapple_folder
     bs = pni.get_binary_signals(base_folder, overwrite=False)
     ephys_file = pynapple_folder / "spikes.npz"
     ephys_data = nap.load_file(str(ephys_file))

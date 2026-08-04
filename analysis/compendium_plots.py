@@ -3,10 +3,13 @@ import pynapple as nap
 from pathlib import Path
 import matplotlib.pyplot as plt
 from analysis import pres_plot_utils as pu
+from utils import file_structure as fs
 
 subj_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2")
-save_folder = subj_folder / "compendium"
-save_folder.mkdir(exist_ok=True)
+#this cross-session compendium is an analysis product, so it is saved under the subject's
+#analysis_files folder rather than next to the raw recordings
+save_folder = fs.category_path(subj_folder, fs.ANALYSIS_ROOT) / "compendium"
+save_folder.mkdir(parents=True, exist_ok=True)
 
 base_folders = [
     Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_050526"),
@@ -14,13 +17,14 @@ base_folders = [
     Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260511"),
 ]
 
-pynapple_folders = [f / "pynapple" for f in base_folders]
+session_folders = [fs.SessionPaths(f) for f in base_folders]
 
 # --- per-session processing ---
 sessions = []
-for pynapple_folder in pynapple_folders:
+for folders in session_folders:
+    pynapple_folder = folders.pynapple_folder
     ep = nap.load_file(pynapple_folder / "sing_tagged_units.npz")
-    bs = nap.load_file(pynapple_folder / "binary_signals.npz")
+    bs = nap.load_file(folders.binary_signals_file())
     bs = pu.add_all_licks(bs)
 
     ch_on, ch_off = pu.pool_task_stim(bs, 'chrimson')
@@ -32,7 +36,7 @@ for pynapple_folder in pynapple_folders:
     lick_mod = pu.id_lick_bout_modulated(ep, bs, te)
     sig_units = lick_mod.loc[lick_mod['significant'], 'unit_id'].tolist()
     ep = ep[sig_units]
-    print(f"{pynapple_folder.parent.name}: {len(sig_units)} / {len(lick_mod)} lick-bout modulated units")
+    print(f"{folders.rec_ID.name}: {len(sig_units)} / {len(lick_mod)} lick-bout modulated units")
 
     sessions.append((ep, bs, te))
 

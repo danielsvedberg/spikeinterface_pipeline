@@ -23,6 +23,7 @@ def get_stimulation_times_df(base_folder):
     event_times_df = pd.concat([on_event_times_df, off_event_times_df], ignore_index=True)
     #order by time
     event_times_df = event_times_df.sort_values(by='time')
+    return event_times_df
 
 
 def get_stimulation_times(base_folder, nidaq_map=None, overwrite=False):

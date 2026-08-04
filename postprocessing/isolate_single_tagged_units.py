@@ -2,15 +2,17 @@ import spikeinterface as si
 import pynapple as nap
 from pathlib import Path
 from postprocessing import parse_opto_tagging as pot
+from utils import file_structure as fs
 
 #base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_050526")
 #base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260506")
 #base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS2\DS2_20260511")
 base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS15\DS15_20260702")
 
-pynapple_folder = base_folder / "pynapple"
+folders = fs.SessionPaths(base_folder)
+pynapple_folder = folders.pynapple_folder
 ephys_file = pynapple_folder / "spikes.npz"
-binary_signals = pynapple_folder / "binary_signals.npz"
+binary_signals = folders.binary_signals_file()
 
 ephys = nap.load_file(ephys_file)
 binary_signals = nap.load_file(binary_signals)

@@ -6,6 +6,7 @@ from spikeinterface.curation import auto_merge_units
 from pathlib import Path
 #from spikeinterface_gui import run_mainwindow
 from spikeinterface.exporters import to_pynapple_tsgroup
+from utils import file_structure as fs
 
 #base_folder = Path("C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250822")
 #spikeglx_folder = Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250822\DS13_20250822_g0")
@@ -17,7 +18,8 @@ from spikeinterface.exporters import to_pynapple_tsgroup
 #spikeglx_folder = Path(r"C:\Users\assad\Documents\recording_files\DS1\DS1_20251117\DS1_20251117_g0")
 
 def curation(base_folder):
-    analyzer = si.load_sorting_analyzer(folder=base_folder / "analyzer")
+    folders = fs.SessionPaths(base_folder).create_output_folders()
+    analyzer = si.load_sorting_analyzer(folder=folders.sorting_path("analyzer"))
 
     clean_sorting = remove_redundant_units(
         analyzer,
@@ -66,24 +68,24 @@ def curation(base_folder):
     keep_unit_ids = keep_units.index.values
     keep_unit_ids
 
-    analyzer_clean = analyzer_merged.select_units(keep_unit_ids, folder=base_folder / 'analyzer_clean', format='binary_folder')
+    analyzer_clean = analyzer_merged.select_units(keep_unit_ids, folder=folders.sorting_path('analyzer_clean'), format='binary_folder')
 
-    si.export_report(analyzer_clean, base_folder / 'report_clean', format='png')
+    si.export_report(analyzer_clean, folders.sorting_path('report_clean'), format='png')
 
-    analyzer_clean = si.load_sorting_analyzer(base_folder / 'analyzer_clean')
+    analyzer_clean = si.load_sorting_analyzer(folders.sorting_path('analyzer_clean'))
 
     my_tsgroup = to_pynapple_tsgroup(analyzer_clean,
         attach_unit_metadata=True)
 
     # Note: can add metadata using e.g.
     # my_tsgroup.set_info({'brain_region': ['MEC', 'MEC', ...]})
-    pynapple_folder = base_folder / "pynapple"
+    pynapple_folder = folders.pynapple_folder
     pynapple_folder.mkdir(exist_ok=True, parents=True)
     my_tsgroup.save(pynapple_folder / "spikes.npz")
 
     #run_mainwindow(analyzer_clean,curation=True)
 
-    analyzer_clean = si.load_sorting_analyzer(base_folder / 'analyzer_clean')
+    analyzer_clean = si.load_sorting_analyzer(folders.sorting_path('analyzer_clean'))
 
     my_tsgroup = to_pynapple_tsgroup(analyzer_clean,
         attach_unit_metadata=True)

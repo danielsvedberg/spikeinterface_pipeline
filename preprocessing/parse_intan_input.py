@@ -14,6 +14,7 @@ import os
 from spikeinterface.extractors import read_split_intan_files
 import spikeinterface.preprocessing as spre
 from pathlib import Path
+from utils import file_structure as fs
 
 default_dinmap = {
     'licks': 1,
@@ -510,14 +511,13 @@ def match_starts_and_ends(starts_ts, ends_ts):
     return matched_starts, matched_ends
 
 def parse_base_folder(base_folder, test_mode=False):
-    #base folder is where the recording files live
+    #base folder is the rec_folder where the raw recording files live
     if base_folder is None:
         if test_mode:
-            #base_folder = Path("C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250822")
-            base_folder = Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250905")
+            base_folder = Path(r"C:\Users\assad\Documents\recording_files\Neptun\Neptun_20260626")
         else:
             #query user to enter base folder in command line
-            print(r"base folder example: C:\Users\assad\Documents\analysis_files\DS13\DS13_20250822")
+            print(r"base folder example: C:\Users\assad\Documents\recording_files\Neptun\Neptun_20260626")
             base_folder_input = input("Please enter the base folder path: ")
             base_folder = Path(base_folder_input)
 
@@ -574,15 +574,20 @@ def parse_channel_maps(base_folder, dinmap, adcmap, optoidx):
 
     return dinmap, adcmap, optoidx
 
-def get_pynapple_folder_and_file(base_folder, overwrite=False):
-    #pynapple folder is where pynapple outputs will be saved
-    pynapple_folder = base_folder / "pynapple"
-    #if pynapple_folder does not exist, create it
-    if not pynapple_folder.exists():
-        pynapple_folder.mkdir(parents=True, exist_ok=True)
-    pynapple_file = pynapple_folder / "binary_signals.npz"
+def get_output_folders(base_folder):
+    """Resolve where a binary-signals run reads and writes (see utils/file_structure.py).
 
-    return pynapple_folder, pynapple_file
+    The event tables and threshold plots stay with the rest of the analysis products in the
+    pynapple folder; binary_signals.npz itself lives in its own binary_signals folder, because
+    sorting needs a copy of it too (kept in step by folders.mirror_binary_signals()).
+    """
+    folders = fs.SessionPaths(base_folder, create=True)
+    pynapple_folder = folders.pynapple_folder
+    pynapple_folder.mkdir(parents=True, exist_ok=True)
+    binary_signals_file = folders.binary_signals_file()
+    binary_signals_file.parent.mkdir(parents=True, exist_ok=True)
+
+    return folders, pynapple_folder, binary_signals_file
 
 def load_pynapple_file(pynapple_file):
     if pynapple_file.exists():
@@ -739,9 +744,10 @@ def find_rhd_folder(base_folder):
 def get_binary_signals(base_folder=None, dinmap=None, adcmap=None, optoidx=None, overwrite=False, plot=False, test_mode=False, plot_save_folder=None):
     #section 1: folder handling
     base_folder = parse_base_folder(base_folder, test_mode=test_mode)
-    rhd_folder = find_rhd_folder(base_folder)
-
-    pynapple_folder, pynapple_file = get_pynapple_folder_and_file(base_folder, overwrite=overwrite)
+    folders, pynapple_folder, pynapple_file = get_output_folders(base_folder)
+    #the .rhd files and the channel map are only ever read from the recording folder
+    rec_folder = folders.recording_folder
+    rhd_folder = find_rhd_folder(rec_folder)
     event_csv_file = pynapple_folder / "binary_signals_events.csv"
     if plot_save_folder is None:
         plot_save_folder = pynapple_folder
@@ -749,11 +755,12 @@ def get_binary_signals(base_folder=None, dinmap=None, adcmap=None, optoidx=None,
     if not overwrite:
         bs = load_pynapple_file(pynapple_file)
         if bs is not None:
+            folders.mirror_binary_signals()
             export_event_table(bs, event_csv_file)
             return bs
 
     #section 2: channel mapping
-    dinmap, adcmap, optoidx = parse_channel_maps(base_folder, dinmap, adcmap, optoidx)
+    dinmap, adcmap, optoidx = parse_channel_maps(rec_folder, dinmap, adcmap, optoidx)
 
     #section 3: read in intan data
     adc_in = read_split_intan_files(rhd_folder, stream_name='USB board ADC input channel')
@@ -860,6 +867,7 @@ def get_binary_signals(base_folder=None, dinmap=None, adcmap=None, optoidx=None,
     # mege first_licks_ts into tsg
     tsg = tsg.merge(first_licks_ts, reset_index=True)
     tsg.save(str(pynapple_file))
+    folders.mirror_binary_signals()
     export_event_table(tsg, event_csv_file)
 
     return tsg

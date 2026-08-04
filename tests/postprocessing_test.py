@@ -6,6 +6,7 @@ from pathlib import Path
 matplotlib.use('Qt5Agg')
 from spikeinterface.curation import remove_duplicated_spikes
 from tests import curation_test as ct
+from utils import file_structure as fs
 
 #base_folder = Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250824")
 #spikeglx_folder = Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250824\DS13_20250824_g0")
@@ -21,11 +22,12 @@ from tests import curation_test as ct
 #base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS21\DS21_20251211")
 #base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS21\DS21_20251213")
 
-#get the folders inside base_folder that end with '_g0'
-spikeglx_folder = list(base_folder.glob('*_g0'))[0]
+folders = fs.SessionPaths(base_folder).create_output_folders()
+#get the folders inside the recording folder that end with '_g0'
+spikeglx_folder = list(folders.recording_folder.glob('*_g0'))[0]
 
-rec = sc.load(base_folder / 'preprocess')
-sorting = si.read_kilosort(folder_path=base_folder / 'kilosort4_output' / 'sorter_output')
+rec = sc.load(folders.sorting_path('preprocess'))
+sorting = si.read_kilosort(folder_path=folders.sorting_path('kilosort4_output', 'sorter_output'))
 clean_sorting = remove_duplicated_spikes(sorting, censored_period_ms=0.1)
 job_kwargs = dict(n_jobs=22, chunk_duration='1s', progress_bar=True)
 
@@ -61,7 +63,7 @@ my_protocol = {
 
 analyzer = si.create_sorting_analyzer(clean_sorting, rec, sparse=True, format="memory", n_jobs=22)
 analyzer.compute(my_protocol['postprocessing'])
-analyzer.save_as(folder=base_folder / "analyzer", format="binary_folder")
+analyzer.save_as(folder=folders.sorting_path("analyzer"), format="binary_folder")
 
 isi_hist = analyzer.extensions['isi_histograms'].data
 isi = isi_hist['isi_histograms']
@@ -75,7 +77,7 @@ for unhist in range(isi.shape[0]):
     maxbinmed = (maxbinlow + maxbinhigh) / 2
     maxbin.append(maxbinmed)
 
-si.export_report(analyzer, base_folder / 'report_uncurated', format='png')
+si.export_report(analyzer, folders.sorting_path('report_uncurated'), format='png')
 
 
 ct.curation(base_folder)

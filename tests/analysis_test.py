@@ -3,9 +3,10 @@ from pathlib import Path
 from preprocessing import parse_nidq as pni
 from analysis import plot_psth as pp
 from postprocessing import parse_opto_tagging as pot
+from utils import file_structure as fs
 
 def run_analysis(base_folder, dinmap=None, ainmap=None, optoidx=None, overwrite=False):
-        pynapple_folder = base_folder / "pynapple"
+        pynapple_folder = fs.SessionPaths(base_folder).pynapple_folder
         bs = pni.get_binary_signals(base_folder, dinmap=dinmap, ainmap=ainmap, optoidx=optoidx, overwrite=overwrite, plot=True)
         ephys_file = pynapple_folder / "spikes.npz"
         ephys_data = nap.load_file(ephys_file)

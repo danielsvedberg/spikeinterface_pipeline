@@ -9,6 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Qt5Agg')
+from utils import file_structure as fs
 
 def curate_units(analyzer_clean):
     #analyzer_clean = si.load_sorting_analyzer(folder=analyzer_path)
@@ -132,5 +133,5 @@ def test():
     # base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS21\DS21_20251209")
     # base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS21\DS21_20251211")
     base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS21\DS21_20251213")
-    analyzer_path = base_folder / 'analyzer_clean'
+    analyzer_path = fs.SessionPaths(base_folder).sorting_path('analyzer_clean')
     curate_units(analyzer_path)

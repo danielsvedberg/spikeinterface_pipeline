@@ -15,11 +15,15 @@ from preprocessing import parse_nidq as pni
 import pynapple as nap
 from postprocessing import parse_opto_tagging as pot
 from analysis import plot_psth as pp
+from utils import file_structure as fs
 
 def run_pipeline(base_folder, nidaq_map=None, bad_chans=None, export_raw_summary=False):
     #base folder needs to be a Path object
+    #sorting/analysis products go to their own category folders, raw data is only read from
+    #the recording folder (see utils/file_structure.py)
+    folders = fs.SessionPaths(base_folder).create_output_folders()
     # Usually, you would read in your raw recording
-    spikeglx_folder = list(base_folder.glob('*_g*'))[0]
+    spikeglx_folder = list(folders.recording_folder.glob('*_g*'))[0]
 
     on_event_times, off_event_times = gsf.get_stimulation_times(base_folder, nidaq_map, overwrite=False)
     #concatenate into one list
@@ -49,7 +53,7 @@ def run_pipeline(base_folder, nidaq_map=None, bad_chans=None, export_raw_summary
         'sorting': {
             'sorter_name': 'kilosort4',
             'verbose': True,
-            'folder': base_folder / 'kilosort4_output',
+            'folder': folders.sorting_path('kilosort4_output'),
             'remove_existing_folder': True,
             'progress_bar': True
         },
@@ -73,7 +77,7 @@ def run_pipeline(base_folder, nidaq_map=None, bad_chans=None, export_raw_summary
 
 
     ow=False
-    preprocess_folder = base_folder / 'preprocess'
+    preprocess_folder = folders.sorting_path('preprocess')
     if not preprocess_folder.is_dir():
         ow = True
 
@@ -89,18 +93,18 @@ def run_pipeline(base_folder, nidaq_map=None, bad_chans=None, export_raw_summary
 
     sorting = si.run_sorter(recording=preprocessed_rec, **my_protocol['sorting'], n_jobs=-1)
 
-    #sorting = si.load(base_folder / 'kilosort4_output' )
-    #preprocessed_rec = si.load(base_folder / 'preprocess')
+    #sorting = si.load(folders.sorting_path('kilosort4_output'))
+    #preprocessed_rec = si.load(folders.sorting_path('preprocess'))
     sorting_clean = si.remove_duplicated_spikes(sorting, method='keep_first_iterative')
 
-    analyzer = si.create_sorting_analyzer(recording=preprocessed_rec, sorting=sorting_clean, folder=base_folder / 'analyzer', format='binary_folder', n_jobs=-1, overwrite=True)
+    analyzer = si.create_sorting_analyzer(recording=preprocessed_rec, sorting=sorting_clean, folder=folders.sorting_path('analyzer'), format='binary_folder', n_jobs=-1, overwrite=True)
 
     job_kwargs=dict(n_jobs=23, progress_bar=True)
     analyzer.compute(my_protocol['postprocessing'], **job_kwargs)
-    analyzer = si.load_sorting_analyzer(folder=base_folder / 'analyzer')
+    analyzer = si.load_sorting_analyzer(folder=folders.sorting_path('analyzer'))
 
     #if export_raw_summary:
-    #    si.export_report(sorting_analyzer=analyzer, output_folder=base_folder / 'sorting_summary_raw', remove_if_exists=True)
+    #    si.export_report(sorting_analyzer=analyzer, output_folder=folders.sorting_path('sorting_summary_raw'), remove_if_exists=True)
     template_diff_thresh = [0.05, 0.15]
 
     to_merge = sic.compute_merge_unit_groups(
@@ -155,21 +159,21 @@ def run_pipeline(base_folder, nidaq_map=None, bad_chans=None, export_raw_summary
     #
 
 
-    analyzer_path = base_folder / 'analyzer_clean'
+    analyzer_path = folders.sorting_path('analyzer_clean')
     if analyzer_path.exists():
         shutil.rmtree(analyzer_path)
-    analyzer_clean.save_as(folder=base_folder / 'analyzer_clean', format='binary_folder')
+    analyzer_clean.save_as(folder=analyzer_path, format='binary_folder')
     #analyzer_clean = si.load_sorting_analyzer(folder=analyzer_path)
 
     #export to pynapple
     from spikeinterface.exporters import to_pynapple_tsgroup
     my_tsgroup = to_pynapple_tsgroup(analyzer_clean,
         attach_unit_metadata=True)
-    pynapple_folder = base_folder / 'pynapple'
-    pynapple_folder.mkdir(exist_ok=True)
+    pynapple_folder = folders.pynapple_folder
+    pynapple_folder.mkdir(parents=True, exist_ok=True)
     my_tsgroup.save(pynapple_folder / 'spikes.npz')
 
-    si.export_report(sorting_analyzer=analyzer_clean, output_folder=base_folder / 'sorting_summary_clean',
+    si.export_report(sorting_analyzer=analyzer_clean, output_folder=folders.sorting_path('sorting_summary_clean'),
                      remove_if_exists=True)
     #plot_sorting_summary(sorting_analyzer=analyzer_clean, curation=True, backend='spikeinterface_gui')
 
@@ -194,7 +198,7 @@ def parse_nidq_kwargs(nidq_map_kwargs):
 def get_pynapple_data(base_folder, nidq_map_kwargs=None, overwrite=False):
     dinmap, ainmap, optoidx = parse_nidq_kwargs(nidq_map_kwargs)
 
-    pynapple_folder = base_folder / "pynapple"
+    pynapple_folder = fs.SessionPaths(base_folder).pynapple_folder
     bs = pni.get_binary_signals(base_folder, dinmap=dinmap, ainmap=ainmap, optoidx=optoidx, overwrite=overwrite,
                                 plot=True)
     ephys_file = pynapple_folder / "spikes.npz"
@@ -215,7 +219,7 @@ def plot_tuning_curves(base_folder, overwrite=False, nidq_map_kwargs=None):
 def plot_opto_psth(base_folder, overwrite=False, nidq_map_kwargs=None):
     ephys_data, bs, pynapple_folder = get_pynapple_data(base_folder, nidq_map_kwargs, overwrite)
     pp.plot_all_opto_psth(ephys_data, bs, pynapple_folder)
-    analyzer = si.load_sorting_analyzer(folder=base_folder / 'analyzer_clean')
+    analyzer = si.load_sorting_analyzer(folder=fs.SessionPaths(base_folder).sorting_path('analyzer_clean'))
     pp.plot_all_opto_psth_alt(ephys_data, bs, pynapple_folder, analyzer=analyzer, minmax=(-0.1, 0.2))
 
 def plot_time_to_first_spike(base_folder, overwrite=False, nidq_map_kwargs=None):
@@ -244,8 +248,9 @@ def test_time_to_first_spike():
 
 
 def launch_sorting_gui(base_folder): #convenience function to launch the sorting GUI on the cleaned analyzer
-    analyzer_clean = si.load_sorting_analyzer(folder=base_folder / 'analyzer_clean')
-    si.export_report(sorting_analyzer=analyzer_clean, output_folder=base_folder / 'sorting_summary_clean', remove_if_exists=True)
+    folders = fs.SessionPaths(base_folder)
+    analyzer_clean = si.load_sorting_analyzer(folder=folders.sorting_path('analyzer_clean'))
+    si.export_report(sorting_analyzer=analyzer_clean, output_folder=folders.sorting_path('sorting_summary_clean'), remove_if_exists=True)
 
 
 ########################################################################################################################

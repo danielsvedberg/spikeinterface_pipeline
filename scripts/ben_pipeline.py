@@ -6,10 +6,14 @@ import spikeinterface.preprocessing as spre
 import spikeinterface.curation as sic
 import spikeinterface.sorters as se
 import pynapple as nap
+from utils import file_structure as fs
 
 probe = get_probe()
 
 base_folder = Path(r"C:\Users\assad\Documents\recording_files\Neptun\Neptun_20260626")
+#sorting products go to sorting_files, pynapple products to analysis_files, and raw .rhd data is
+#only read from the recording folder (see utils/file_structure.py)
+folders = fs.SessionPaths(base_folder).create_output_folders()
 
 def find_rhd_folder(base_folder):
     rhd_folders = [f for f in Path(base_folder).rglob("*") if f.is_dir() and any(f.glob("*.rhd"))]
@@ -17,7 +21,7 @@ def find_rhd_folder(base_folder):
         raise ValueError(f"Multiple .rhd folders found: {rhd_folders}")
     return rhd_folders[0] if rhd_folders else None
 
-rhd_folder = find_rhd_folder(base_folder)
+rhd_folder = find_rhd_folder(folders.recording_folder)
 
 ephys = read_split_intan_files(rhd_folder, stream_name='RHD2000 amplifier channel')
 ephys = spre.unsigned_to_signed(ephys)
@@ -50,7 +54,7 @@ my_protocol = {
     'sorting': {
         'sorter_name': 'kilosort4',
         'verbose': True,
-        'folder': base_folder / 'kilosort4_output',
+        'folder': folders.sorting_path('kilosort4_output'),
         'remove_existing_folder': True,
         'progress_bar': True
     },
@@ -73,27 +77,27 @@ my_protocol = {
 }
 
 preprocessed_rec = si.apply_preprocessing_pipeline(ephys, my_protocol['preprocessing'])
-preprocessed_rec.save(folder=base_folder / 'preprocess', format='binary', n_jobs=-1, progress_bar=True, overwrite=True)
-# preprocessed_rec = si.load(base_folder / 'preprocess')
+preprocessed_rec.save(folder=folders.sorting_path('preprocess'), format='binary', n_jobs=-1, progress_bar=True, overwrite=True)
+# preprocessed_rec = si.load(folders.sorting_path('preprocess'))
 sorting = si.run_sorter(recording=preprocessed_rec, **my_protocol['sorting'])
 
-# sorting = si.load(base_folder / 'kilosort4_output' )
-# preprocessed_rec = si.load(base_folder / 'preprocess')
+# sorting = si.load(folders.sorting_path('kilosort4_output'))
+# preprocessed_rec = si.load(folders.sorting_path('preprocess'))
 sorting_clean = si.remove_duplicated_spikes(sorting, method='keep_first_iterative')
 
 analyzer = si.create_sorting_analyzer(recording=preprocessed_rec, sorting=sorting_clean,
-                                      folder=base_folder / 'analyzer', format='binary_folder', n_jobs=-1,
+                                      folder=folders.sorting_path('analyzer'), format='binary_folder', n_jobs=-1,
                                       overwrite=True)
 
 job_kwargs = dict(n_jobs=23, progress_bar=True)
 analyzer.compute(my_protocol['postprocessing'], **job_kwargs)
-analyzer = si.load_sorting_analyzer(folder=base_folder / 'analyzer')
+analyzer = si.load_sorting_analyzer(folder=folders.sorting_path('analyzer'))
 
 from spikeinterface_gui import run_mainwindow
 # open and run the Qt app
 run_mainwindow(analyzer, mode="desktop", curation=True)
 
-si.export_report(sorting_analyzer=analyzer, output_folder=base_folder / 'sorting_summary_raw', remove_if_exists=True)
+si.export_report(sorting_analyzer=analyzer, output_folder=folders.sorting_path('sorting_summary_raw'), remove_if_exists=True)
 template_diff_thresh = [0.05, 0.1]
 
 to_merge = sic.compute_merge_unit_groups(
@@ -147,11 +151,11 @@ analyzer_clean = analyzer_merged.select_units(keep_unit_ids)
 #
 
 
-analyzer_path = base_folder / 'analyzer_clean'
+analyzer_path = folders.sorting_path('analyzer_clean')
 import shutil
 if analyzer_path.exists():
     shutil.rmtree(analyzer_path)
-analyzer_clean.save_as(folder=base_folder / 'analyzer_clean', format='binary_folder')
+analyzer_clean.save_as(folder=analyzer_path, format='binary_folder')
 # analyzer_clean = si.load_sorting_analyzer(folder=analyzer_path)
 
 # export to pynapple
@@ -159,10 +163,10 @@ from spikeinterface.exporters import to_pynapple_tsgroup
 
 my_tsgroup = to_pynapple_tsgroup(analyzer_clean,
                                  attach_unit_metadata=True)
-pynapple_folder = base_folder / 'pynapple'
-pynapple_folder.mkdir(exist_ok=True)
+pynapple_folder = folders.pynapple_folder
+pynapple_folder.mkdir(parents=True, exist_ok=True)
 my_tsgroup.save(pynapple_folder / 'spikes.npz')
 
-si.export_report(sorting_analyzer=analyzer_clean, output_folder=base_folder / 'sorting_summary_clean',
+si.export_report(sorting_analyzer=analyzer_clean, output_folder=folders.sorting_path('sorting_summary_clean'),
                  remove_if_exists=True)
 # plot_sorting_summary(sorting_analyzer=analyzer_clean, curation=True, backend='spikeinterface_gui')

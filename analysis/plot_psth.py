@@ -9,6 +9,7 @@ matplotlib.use('Qt5Agg')
 import re
 #joblib
 from joblib import Parallel, delayed
+from utils import file_structure as fs
 
 def plot_psth(timestamps, tref, unitID, event_ID, save_folder=None, minmax=(-1, 1), off_event=None):
 
@@ -900,22 +901,22 @@ def plot_all_opto_psth(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), anal
 
 def test(base_folder=None):
     if base_folder is None:
-        base_folder = Path("C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250822")
-    #    base_folder = Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250905")
+        base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS13\DS13_20250822")
 
-    pynapple_folder = base_folder / "pynapple"
+    folders = fs.SessionPaths(base_folder)
+    pynapple_folder = folders.pynapple_folder
 
     ephys_file = pynapple_folder / "spikes.npz"
     ephys_data = nap.load_file(ephys_file)
-    sigs_file = pynapple_folder / "binary_signals.npz"
+    sigs_file = folders.binary_signals_file()
     sigs = nap.load_file(sigs_file)
 
     plot_on_events_psth(ephys_data, sigs, pynapple_folder)
 
 def plot_all():
     base_folders = [
-        Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250822"),
-        Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250905"),
+        Path(r"C:\Users\assad\Documents\recording_files\DS13\DS13_20250822"),
+        Path(r"C:\Users\assad\Documents\recording_files\DS13\DS13_20250905"),
     ]
     for base_folder in base_folders:
         test(base_folder=base_folder)

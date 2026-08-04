@@ -8,6 +8,7 @@ import spikeinterface.extractors as se
 import spikeinterface.preprocessing as spp
 
 from pathlib import Path
+from utils import file_structure as fs
 #base_folder = Path("C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250822")
 #base_folder = Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250905")
 #base_folder = Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250824")
@@ -17,8 +18,9 @@ from pathlib import Path
 #base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS21\DS21_20251211")
 base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS21\DS21_20251213")
 
-#get the folders inside base_folder that end with '_g0'
-spikeglx_folder = list(base_folder.glob('*_g0'))[0]
+folders = fs.SessionPaths(base_folder).create_output_folders()
+#get the folders inside the recording folder that end with '_g0'
+spikeglx_folder = list(folders.recording_folder.glob('*_g0'))[0]
 
 stream_names, stream_ids = si.get_neo_streams('spikeglx', spikeglx_folder)
 raw_rec = si.read_spikeglx(spikeglx_folder, stream_id='imec0.ap')
@@ -43,12 +45,12 @@ rec_CAR = si.common_reference(rec, operator="average", reference="global")
 
 job_kwargs = dict(n_jobs=-1, chunk_duration='1s', progress_bar=True)
 
-rec_CAR.save(folder=base_folder / 'preprocess', format='binary', **job_kwargs)
-rec = sc.load(base_folder / 'preprocess')
+rec_CAR.save(folder=folders.sorting_path('preprocess'), format='binary', **job_kwargs)
+rec = sc.load(folders.sorting_path('preprocess'))
 
 paramsKS4 = si.get_default_sorter_params('kilosort4')
 paramsKS4['n_jobs'] = -1
 paramsKS4['do_CAR'] = False
 
-sorting = si.run_sorter('kilosort4', rec, folder=base_folder / 'kilosort4_output' ,
+sorting = si.run_sorter('kilosort4', rec, folder=folders.sorting_path('kilosort4_output'),
                         verbose=True, **paramsKS4)

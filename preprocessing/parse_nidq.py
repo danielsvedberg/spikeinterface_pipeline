@@ -11,6 +11,7 @@ from pathlib import Path
 from sklearn.mixture import GaussianMixture
 import ast
 import os
+from utils import file_structure as fs
 
 default_dinmap = {
     'licks': 0,
@@ -115,7 +116,10 @@ def parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_sup
 
     digchids = digital_events.channel_ids
     times = digital_events.get_event_times(digchids[tone_din])
-    tone_times = map2imectime(times)
+    if map2imectime is not None:
+        tone_times = map2imectime(times)
+    else:
+        tone_times = times
 
     mididx = len(tone_times) // 2
     tone_onsets = tone_times[:mididx]
@@ -286,7 +290,7 @@ def parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support, verbos
     return ts_list, ts_index
 
 
-def get_digital_ts(digital_events, map2imectime, time_support, din=None, event_name='lick'):
+def get_digital_ts(digital_events, time_support, map2imectime=None, din=None, event_name='lick'):
     if din is None:
         print("Warning: din not specified, using default channel 0 for lick events.")
         din = 0
@@ -294,7 +298,8 @@ def get_digital_ts(digital_events, map2imectime, time_support, din=None, event_n
     #lick_ontimes, lickofftimes = get_licks(digital_events, map2imectime)
     digchids = digital_events.channel_ids
     times = digital_events.get_event_times(digchids[din])
-    times = map2imectime(times)
+    if map2imectime is not None:
+        times = map2imectime(times)
     n_times = len(times)
     offtimes = times[n_times//2:]
     ontimes = times[:n_times//2]
@@ -635,14 +640,13 @@ def match_starts_and_ends(starts_ts, ends_ts):
     return matched_starts, matched_ends
 
 def parse_base_folder(base_folder, test_mode=False):
-    #base folder is where the recording files live
+    #base folder is the rec_folder where the raw recording files live
     if base_folder is None:
         if test_mode:
-            #base_folder = Path("C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250822")
-            base_folder = Path(r"C:\Users\assad\Documents\analysis_files\DS13\DS13_20250905")
+            base_folder = Path(r"C:\Users\assad\Documents\recording_files\DS13\DS13_20250905")
         else:
             #query user to enter base folder in command line
-            print(r"base folder example: C:\Users\assad\Documents\analysis_files\DS13\DS13_20250822")
+            print(r"base folder example: C:\Users\assad\Documents\recording_files\DS13\DS13_20250822")
             base_folder_input = input("Please enter the base folder path: ")
             base_folder = Path(base_folder_input)
 
@@ -651,42 +655,21 @@ def parse_base_folder(base_folder, test_mode=False):
 
     return base_folder
 
-def get_spikeglx_folder(base_folder):
-    #spikeglx folder is where the _g# folder lives
-    #infer the spikeglx folder by looking for a folder that ends with the same pattern as the base folder, plust "_g#"
-    subfolders = [f for f in base_folder.iterdir() if f.is_dir() and '_g' in f.name]
-    if len(subfolders) == 0:
-        raise FileNotFoundError(f"No SpikeGLX folder found in {base_folder}")
-    elif len(subfolders) > 1:
-        print(f"Multiple SpikeGLX folders found in {base_folder}, enter the number corresponding to the desired _g# folder:")
-        gnum = input(f"Available folders: {[f.name for f in subfolders]} \n Enter g# number: ")
-        spikeglx_folder = [f for f in subfolders if f"_g{gnum}" in f.name][0]
-    else:
-        spikeglx_folder = subfolders[0]
-    return spikeglx_folder
+def get_spikeglx_folder(paths, gnum=None):
+    #the lookup itself is SessionPaths.spikeglx_folder (see utils/file_structure.py), which always
+    #searches the session's recording folder. All this wrapper adds is the console prompt for
+    #choosing between several _g# runs, which does not belong in a shared layout module
+    if gnum is None and len(paths.spikeglx_folders) > 1:
+        candidates = paths.spikeglx_folders
+        print(f"Multiple SpikeGLX folders found in {paths.recording_folder}, enter the number corresponding to the desired _g# folder:")
+        gnum = input(f"Available folders: {[f.name for f in candidates]} \n Enter g# number: ")
+    return paths.spikeglx_folder(gnum)
 
-def get_imec_folder(base_folder):
-    #return the path to the subfolder of base_folder containing the files ending in imec[#].ap.bin and imec[#].ap.meta
-    spikeglx_folder = get_spikeglx_folder(base_folder)
-    subfolders = [f for f in spikeglx_folder.iterdir() if f.is_dir()]
-    
-    if len(subfolders) == 0:
-        raise FileNotFoundError(f"No IMEC probe folders found in {spikeglx_folder}")
-    
-    # Search for folders containing imec[#].ap.bin and imec[#].ap.meta files
-    for subfolder in subfolders:
-        bin_files = list(subfolder.glob("*.imec[0-9]*.ap.bin"))
-        meta_files = list(subfolder.glob("*.imec[0-9]*.ap.meta"))
-        if len(bin_files) > 0 and len(meta_files) > 0:
-            return subfolder
-    
-    # If not found in subfolders, check the spikeglx_folder itself
-    bin_files = list(spikeglx_folder.glob("imec[0-9]*.ap.bin"))
-    meta_files = list(spikeglx_folder.glob("imec[0-9]*.ap.meta"))
-    if len(bin_files) > 0 and len(meta_files) > 0:
-        return spikeglx_folder
-    
-    raise FileNotFoundError(f"No IMEC probe files (imec[#].ap.bin and imec[#].ap.meta) found in {spikeglx_folder}")
+def get_imec_folder(paths, gnum=None):
+    #the folder holding imec[#].ap.bin / imec[#].ap.meta. The run folder goes through the wrapper
+    #above so a multi-run session is only asked about once, then the probe folder is found inside
+    #whichever run was chosen -- which is why this is not simply paths.imec_folder(gnum)
+    return fs.find_imec_folder(get_spikeglx_folder(paths, gnum))
 
 def get_timing_pulse_din(dinmap):
     if 'timing_pulse' not in dinmap.keys():
@@ -696,11 +679,14 @@ def get_timing_pulse_din(dinmap):
         pulse_din = dinmap['timing_pulse']
     return pulse_din
 
-def get_maps_from_txt(base_folder):
-    #get 'config.txt' from base_folder
-    config_file = base_folder / 'nidaq_map.txt'
-    if not config_file.exists():
-        raise FileNotFoundError(f"No nidaq_map.txt file found in {base_folder}")
+def get_maps_from_txt(paths):
+    #SessionPaths.input_map finds the channel map beside the raw data, whatever the rig named it,
+    #and is None when the session came without one
+    config_file = paths.input_map
+    if config_file is None:
+        raise FileNotFoundError(
+            f"No channel map ({' or '.join(fs.INPUT_MAP_FILES)}) found in "
+            f"{paths.recording_folder}")
 
     vars_dict = {}
     with open(config_file) as f:
@@ -712,10 +698,11 @@ def get_maps_from_txt(base_folder):
                 vars_dict[name] = value
 
     #check that dinmap, ainmap, and optoidx are in vars_dict
-    required_keys = ['dinmap', 'ainmap', 'optoidx']
-    for key in required_keys:
+    keys = ['dinmap', 'ainmap', 'optoidx']
+    for key in keys:
         if key not in vars_dict.keys():
-            raise KeyError(f"{key} not found in nidaq_map.txt")
+            vars_dict[key] = None
+            print(f"Warning: {key} not found in {config_file}, using None for {key}.")
 
     dinmap = vars_dict["dinmap"]
     ainmap = vars_dict["ainmap"]
@@ -723,19 +710,17 @@ def get_maps_from_txt(base_folder):
 
     return dinmap, ainmap, optoidx
 
-def parse_channel_maps(base_folder, dinmap, ainmap, optoidx):
-    #if all of dinmap, ainmap, and optoidx are None, try to get them from nidaq_map.txt
+def parse_channel_maps(paths, dinmap, ainmap, optoidx):
+    #if all of dinmap, ainmap, and optoidx are None, try to get them from the session's channel map
     #dinmap should be a dictionary mapping digital channel ids to event names
     #ainmap should be a dictionary mapping analog channel ids to event names
     if (dinmap is not None) and (ainmap is not None) and (optoidx is not None):
         return dinmap, ainmap, optoidx
     elif (dinmap is None) and (ainmap is None) and (optoidx is None):
-        #check that nidaq_map.txt exists in base_folder
-        config_file = base_folder / 'nidaq_map.txt'
-        if config_file.exists():
-            dinmap, ainmap, optoidx = get_maps_from_txt(base_folder)
+        if paths.input_map is not None:
+            dinmap, ainmap, optoidx = get_maps_from_txt(paths)
         else:
-            print("Warning: No nidaq_map.txt file found in base folder, using default channel maps.")
+            print("Warning: No channel map file found in the recording folder, using default channel maps.")
             dinmap = default_dinmap
             ainmap = default_ainmap
             optoidx = default_optoidx
@@ -744,15 +729,23 @@ def parse_channel_maps(base_folder, dinmap, ainmap, optoidx):
 
     return dinmap, ainmap, optoidx
 
-def get_pynapple_folder_and_file(base_folder, overwrite=False):
-    #pynapple folder is where pynapple outputs will be saved
-    pynapple_folder = base_folder / "pynapple"
-    #if pynapple_folder does not exist, create it
-    if not pynapple_folder.exists():
-        pynapple_folder.mkdir(parents=True, exist_ok=True)
-    pynapple_file = pynapple_folder / "binary_signals.npz"
+def get_output_folders(paths):
+    """Resolve where a binary-signals run writes (see utils/file_structure.py).
 
-    return pynapple_folder, pynapple_file
+    The event tables and threshold plots stay with the rest of the analysis products in the
+    pynapple folder; binary_signals.npz itself lives in its own binary_signals folder, because
+    sorting needs a copy of it too (kept in step by paths.mirror_binary_signals()).
+
+    Creates the session's output folders first, so this works whether or not the SessionPaths it
+    was handed was built with create=True -- without that the accessors below would be None.
+    """
+    paths.create_output_folders()
+    pynapple_folder = paths.pynapple_folder
+    pynapple_folder.mkdir(parents=True, exist_ok=True)
+    binary_signals_file = paths.binary_signals_file()
+    binary_signals_file.parent.mkdir(parents=True, exist_ok=True)
+
+    return pynapple_folder, binary_signals_file
 
 def load_pynapple_file(pynapple_file):
     if pynapple_file.exists():
@@ -902,11 +895,14 @@ def _unique_output_path(path):
 
 
 def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, overwrite=False, plot=False, test_mode=False, plot_save_folder=None):
-    #section 1: folder handling
+    #section 1: folder handling. one SessionPaths resolves every location this run needs -- raw
+    #data and the channel map out of recording_files, products into analysis_files -- so nothing
+    #below has to re-derive a path from base_folder
     base_folder = parse_base_folder(base_folder, test_mode=test_mode)
-    spikeglx_folder = get_spikeglx_folder(base_folder)
-    imec_folder = get_imec_folder(base_folder)
-    pynapple_folder, pynapple_file = get_pynapple_folder_and_file(base_folder, overwrite=overwrite)
+    paths = fs.SessionPaths(base_folder, create=True)
+    pynapple_folder, pynapple_file = get_output_folders(paths)
+    spikeglx_folder =paths.spikeglx_folder()
+    imec_folder = paths.imec_folder(fail_quietly=True)
     event_csv_file = pynapple_folder / "binary_signals_events.csv"
     if plot_save_folder is None:
         plot_save_folder = pynapple_folder
@@ -914,14 +910,18 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
     if not overwrite:
         bs = load_pynapple_file(pynapple_file)
         if bs is not None:
+            paths.mirror_binary_signals()
             export_event_table(bs, event_csv_file)
             return bs
 
     #section 2: channel mapping
-    dinmap, ainmap, optoidx = parse_channel_maps(base_folder, dinmap, ainmap, optoidx)
+    dinmap, ainmap, optoidx = parse_channel_maps(paths, dinmap, ainmap, optoidx)
 
     #section 3: read in spikeglx data
-    imec_rec = si.read_spikeglx(imec_folder, stream_name='imec0.ap', load_sync_channel=True)
+    if imec_folder is not None:
+        imec_rec = si.read_spikeglx(imec_folder, stream_name='imec0.ap', load_sync_channel=True)
+    else:
+        imec_rec = None
     nidq_rec = si.read_spikeglx(spikeglx_folder, stream_id='nidq')
 
     chids = nidq_rec.channel_ids #get all channel ids--channels are indexed using alphanumeric string identifier
@@ -932,10 +932,14 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
 
     #section 4: align nidq to imec time
     pulse_din = get_timing_pulse_din(dinmap)
-    map2imectime = get_nidq_aligner(imec_rec, digital_events, pulse_din)
     nidq_t = nidq_rec.get_times()
     nidq_t = nidq_t - nidq_t[0]  # zeroing time
-    nidq_t_aligned = map2imectime(nidq_t)
+    if imec_rec is not None:
+        map2imectime = get_nidq_aligner(imec_rec, digital_events, pulse_din)
+        nidq_t_aligned = map2imectime(nidq_t)
+    else:
+        nidq_t_aligned = nidq_t
+        map2imectime = None
     time_support = nap.IntervalSet(start=nidq_t_aligned[0], end=nidq_t_aligned[-1])
 
     #analog event index
@@ -943,7 +947,7 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
     ts_idx = []
     if 'solenoid' in dinmap.keys():
         solenoid_din = dinmap['solenoid']
-        solenoid_ts_list, solenoid_ts_idx = get_digital_ts(digital_events, map2imectime, time_support, solenoid_din, event_name='solenoid')
+        solenoid_ts_list, solenoid_ts_idx = get_digital_ts(digital_events,time_support, map2imectime, solenoid_din, event_name='solenoid')
     elif 'solenoid' in ainmap.keys():
         solenoid_ts_list, solenoid_ts_idx = parse_solenoid_analog(analog_events, nidq_t_aligned, idx=ainmap, plot=plot)
     else:
@@ -962,7 +966,7 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
 
     if 'licks' in dinmap.keys():
         lick_din = dinmap['licks']
-        lick_ts_list, lick_ts_idx = get_digital_ts(digital_events, map2imectime, time_support, lick_din)
+        lick_ts_list, lick_ts_idx = get_digital_ts(digital_events, time_support, map2imectime, lick_din)
     else:
         raise ValueError("Lick channel not found in dinmap.")
 
@@ -975,12 +979,12 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
         ts_idx += opto_ts_idx
 
     if ('chrimson' in dinmap.keys()):
-        chrimson_ts_list, chrimson_ts_idx = get_digital_ts(digital_events, map2imectime, time_support, dinmap['chrimson'], event_name='chrimson')
+        chrimson_ts_list, chrimson_ts_idx = get_digital_ts(digital_events, time_support, map2imectime, dinmap['chrimson'], event_name='chrimson')
         ts_list += chrimson_ts_list
         ts_idx += chrimson_ts_idx
 
     if ('chr2' in dinmap.keys()):
-        chr2_ts_list, chr2_ts_idx = get_digital_ts(digital_events, map2imectime, time_support, dinmap['chr2'], event_name='chr2')
+        chr2_ts_list, chr2_ts_idx = get_digital_ts(digital_events, time_support, map2imectime, dinmap['chr2'], event_name='chr2')
         ts_list += chr2_ts_list
         ts_idx += chr2_ts_idx
 
@@ -1065,6 +1069,7 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
     # mege first_licks_ts into tsg
     tsg = tsg.merge(first_licks_ts, reset_index=True)
     tsg.save(str(pynapple_file))
+    paths.mirror_binary_signals()
     export_event_table(tsg, event_csv_file)
 
     return tsg
@@ -1078,5 +1083,6 @@ def test():
     overwrite=True
     plot=True
     plot_save_folder = None
-    base_folder = Path(r'C:\\Users\\assad\\Documents\\analysis_files\\DS13\\DS13_20250824')
+    #base_folder = Path(r'C:\Users\assad\Documents\recording_files\DS13\DS13_20250824')
+    base_folder = Path(r"C:\Users\assad\Desktop\experiment_data\recording_files\DS48\DS48_20260729")
     tsg = get_binary_signals(base_folder,dinmap,ainmap,optoidx,overwrite,plot,test_mode)
