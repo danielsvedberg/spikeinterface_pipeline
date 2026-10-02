@@ -1,5 +1,6 @@
 {
     "python.defaultInterpreterPath": "C:\\Users\\assad\\miniconda3\\envs\\si_env\\python.exe",
+    "jupyter.notebookFileRoot": "${workspaceFolder}",
     "python.terminal.activateEnvironment": true,
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda"

@@ -190,7 +190,23 @@ differ). Then `parse_trials`: rewarded first lick = last lick <= solenoid_on, ea
   flat at ~34 GB total, ~8 min per session in parallel. (Diffs now list every event with
   "0 times moved": sub-ns differences between the recovered and original fit.)
 
-### 5. Curation + re-analysis batch on D: — running overnight (2026-10-01 22:20)
+### 5. Curation + re-analysis batch on D: — done, awaiting the user's review (2026-10-02)
+Overnight run finished 03:55. Cleaning (clean units / good + non_soma_good): DS45 0814 269 /
+47+4, 0819 291 / 53+4, 0820 384 / 88+4, 0821 296 / 57+6; DS2 0505 429 / 68+3, 0506 328 / 30+0
+(487 noise units dropped of 792), 0511 385 / 49+0. Analysis (pynapple + isolate with the new tagging + ratio_tests) ok for all
+17 sorted sessions; tagged single units (final_classif):
+DS48 0921 dSPN 7, mu 1 | 0922 iSPN 16, dSPN 10, mu 10 | 0923 iSPN 21, dSPN 16, mu 10 |
+0924 dSPN 10, iSPN 7, mu 1; DS15 0701 dSPN 2 | 0702 iSPN 5, dSPN 3, mu 2 | 0703 dSPN 5, iSPN 1 |
+0707 iSPN 4; DS45 0811 dSPN 8, iSPN 4, mu 1 | 0812 dSPN 5, mu 2, iSPN 1 | 0814 dSPN 5, iSPN 1 |
+0819 iSPN 4 | 0820 iSPN 6, mu 2 | 0821 iSPN 2; DS2 0505 dSPN 12, mu 1 | 0506 dSPN 2 |
+0511 dSPN 6, iSPN 2, mu 2. Possible false negatives (tagged, failing quality) are 33–206 per
+session (issue 3). DS48 compendium ok (164 units). The single compendium process then
+segfaulted starting DS15's (native crash, right after its sessions merged; same plots ran fine
+in their own process on 2026-10-01) — rebuilding DS15, DS45, DS2 one process each with
+faulthandler on (scratchpad `one_compendium.py`). All four compendia now done: DS48 (164 lick-bout
+modulated units), DS15 (148), DS45 (229, after clearing the numba cache — issue 7), DS2 (114).
+
+Overnight run notes (2026-10-01 22:20):
 2026-10-01 overnight run (scratchpad `run_parallel.sh`, logs `par_<session>_<step>.log`,
 summary `parallel.log`): cleaning 3 sessions at a time, then pynapple+isolate+ratio_tests for
 all 17 sorted sessions 2 at a time (DS48, DS15 first), then the DS48/DS15/DS45/DS2 compendia.
@@ -242,6 +258,22 @@ Windows access violation inside pynapple's numba `jitcount`, never in a single p
 lick-onset PSTHs of DS48 0923. Probably concurrent workers on numba's `cache=True` files.
 Workaround: `curate_subject.py` redoes the step in-process on `TerminatedWorkerError`.
 `plot_psth.py` itself is unchanged.
+- 2026-10-01: likely cause found in the repo's own `utils/mpl_backend.py` (an earlier fix):
+  loky workers that import a Qt matplotlib backend have no event loop, and on Windows that
+  surfaces as sporadic access violations in unrelated native code such as numba kernels. Check
+  whether `analysis/plot_psth.py` (or what it imports) sets a Qt backend instead of calling
+  `mpl_backend.select_backend()`; if so, that is the fix.
+- 2026-10-02: the same access violation in pynapple's `jitcount` hit a *single* process (no
+  workers, Agg backend): the DS45 compendium, in `plot_dspn_ispn_lick_bout_bar` ->
+  `_zscore_diff` -> `TsGroup.count`, and it killed the combined compendium run at DS15. Inputs
+  checked and valid (merged time support sorted, non-overlapping; spikes sorted, none outside).
+  pynapple's numba cache (`site-packages/pynapple/core/__pycache__/*.nbi|*.nbc`, cache=True)
+  dated from March–June — compiled before the env's current numba 0.61.2 / numpy 2.2.6, and
+  numba does not invalidate a cache on dependency upgrades. Moved aside (23 files, to the
+  scratchpad `pynapple_numba_cache_backup/`) so numba recompiles; rebuilding the DS45
+  compendium to test. If it recurs, the Qt-backend lead above is next.
+  Result: the DS45 compendium then completed (6 sessions, 25 figures) where it had crashed
+  twice. Consistent with the stale cache, but one clean run is not proof — keep an eye out.
 
 ### 8. Compendium session list points at C: copies — open (2026-10-01)
 `analysis/compendium_plots.py`'s `__main__` list uses `C:\Users\assad\Desktop\experiment_data\

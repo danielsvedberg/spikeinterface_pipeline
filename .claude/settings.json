@@ -8,10 +8,23 @@
       "Read(//c/Users/assad/miniconda3/envs/**)",
       "Bash(mkdir -p \"c:/Users/assad/Documents/codevault/spikeinterface_pipeline/.vscode\")",
       "Bash(\"C:/Users/assad/miniconda3/envs/si_env/python.exe\" plot_opto_waveforms.py)",
-      "Bash(C:/Users/assad/miniconda3/envs/si_env/python.exe -c ' *)"
+      "Bash(C:/Users/assad/miniconda3/envs/si_env/python.exe -c ' *)",
+      "Bash(ls ~/.vscode/extensions 2>/dev/null | grep -iE \"python|jupyter\" ; echo \"---code cli---\"; which code 2>/dev/null; echo \"---settings---\"; ls .vscode 2>/dev/null)",
+      "Read(//c/Users/assad/.vscode/extensions/**)",
+      "Bash(python -c \"import IPython, sys; print\\('ipython', IPython.__version__\\); print\\(sys.executable\\)\")",
+      "Bash(python -c \"import ipykernel; print\\('ipykernel ok'\\)\")",
+      "Bash(ls ~/miniconda3/envs ~/anaconda3/envs ~/AppData/Local/miniconda3/envs ~/AppData/Local/anaconda3/envs 2>/dev/null)",
+      "Bash(\"/c/Users/assad/miniconda3/envs/si_env/python.exe\" -c \"import IPython,ipykernel;print\\('IPython',IPython.__version__\\);print\\('ipykernel',ipykernel.__version__\\)\")",
+      "Bash(grep -iE \"REPL|interactiveWindow|executeSelection\" ~/AppData/Roaming/Code/User/settings.json 2>/dev/null || echo \"\\(no REPL/interactive settings in user settings.json\\)\")",
+      "Read(//c/Users/assad/AppData/Roaming/Code/User/**)",
+      "Bash(/c/Users/assad/miniconda3/envs/si_env/python.exe -c 'import jupyter_client; print\\('\\\\''jupyter_client'\\\\'', jupyter_client.__version__\\)')",
+      "Bash(/c/Users/assad/miniconda3/envs/si_env/python.exe -)",
+      "Bash(\"/c/Users/assad/miniconda3/envs/si_env/python.exe\" -)",
+      "Bash(/c/Users/assad/miniconda3/envs/si_env/python.exe -c ' *)"
     ],
     "additionalDirectories": [
-      "c:\\Users\\assad\\Documents\\codevault\\spikeinterface_pipeline"
+      "c:\\Users\\assad\\Documents\\codevault\\spikeinterface_pipeline",
+      "C:\\Users\\assad\\AppData\\Roaming\\Code\\User"
     ]
   }
 }
