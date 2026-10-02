@@ -1,11 +1,11 @@
 import pynapple as nap
 import numpy as np
 from pathlib import Path
+from utils.mpl_backend import select_backend
+select_backend()  # Qt in the main process, headless Agg in joblib workers
 import matplotlib.pyplot as plt
-import matplotlib
 import matplotlib.gridspec as gridspec
 import matplotlib.transforms as mtransforms
-matplotlib.use('Qt5Agg')
 import re
 #joblib
 from joblib import Parallel, delayed
@@ -289,8 +289,7 @@ def _draw_opto_psth_on_axes(timestamps, opsin, power_trefs, power_off_events,
     ax_psth.set_xlabel("t(s)", fontsize=fontsize)
 
 
-_OPSIN_WF_COLORS = {'chr2': 'steelblue', 'chrimson': 'darkorange'}
-_OPSIN_CMAPS     = {'chrimson': plt.cm.Oranges, 'chr2': plt.cm.Blues}
+_OPSIN_CMAPS    = {'chrimson': plt.cm.Oranges, 'chr2': plt.cm.Blues}
 
 
 def _precompute_tagging_data(ephys_data, bs, opsins,
@@ -409,11 +408,12 @@ def _precompute_tagging_data(ephys_data, bs, opsins,
 
 def plot_opto_psth_single_unit(timestamps, opsin_data, unitID,
                                waveform_data=None, unit_label=None,
-                               save_folder=None, minmax=(-0.5, 0.5)):
+                               save_folder=None, minmax=(-0.5, 0.5), waveform_t_ms=None):
     """
     Plot chrimson and chr2 PSTH + raster side-by-side for one unit.
     When waveform_data is provided a third row of waveform plots is added
-    below the raster (peak channel, spikes during opto-on intervals only).
+    below each raster: the peak-channel waveform of every spike fired during that
+    raster's pulses, coloured by power (see _precompute_opto_waveforms).
 
     Parameters
     ----------
@@ -424,8 +424,10 @@ def plot_opto_psth_single_unit(timestamps, opsin_data, unitID,
     unitID : int or str
         Unit identifier.
     waveform_data : dict or None
-        ``{opsin_name: ndarray (n_spikes, n_samples) or None}``
+        ``{opsin_name: (ndarray (n_spikes, n_samples), powers (n_spikes,)) or None}``
         Pre-selected waveforms (peak channel) per opsin.
+    waveform_t_ms : ndarray
+        Time axis of the waveforms, ms from the spike; required with waveform_data.
     save_folder : Path or None
     minmax : tuple
     """
@@ -465,18 +467,10 @@ def plot_opto_psth_single_unit(timestamps, opsin_data, unitID,
     if has_wf:
         for col, opsin in enumerate(opsins):
             ax = axs[2, col]
-            wfs = waveform_data.get(opsin)
-            color = _OPSIN_WF_COLORS.get(opsin, 'grey')
-            if wfs is not None and len(wfs) > 0:
-                for wf in wfs:
-                    ax.plot(wf, color=color, alpha=0.2, linewidth=0.5)
-                ax.plot(wfs.mean(axis=0), color='black', linewidth=2,
-                        label=f'mean (n={len(wfs)})')
-                ax.legend(fontsize=12, loc='upper left', bbox_to_anchor=(1.01, 1), borderaxespad=0)
-            else:
-                ax.text(0.5, 0.5, 'no spikes in interval',
-                        transform=ax.transAxes, ha='center', va='center', color='grey')
-            ax.set_xlabel('Sample', fontsize=15)
+            _draw_opto_waveforms(ax, waveform_t_ms, waveform_data.get(opsin), opsin,
+                                 fontsize=12)
+            ax.set_title(f'{opsin}: every spike during the pulses', fontsize=12)
+            ax.set_xlabel('t(ms) from spike', fontsize=15)
             if col == 0:
                 ax.set_ylabel('Amplitude (µV)', fontsize=15)
 
@@ -541,72 +535,150 @@ def _collect_opsin_events(bs_metadata, bs, opsin, stim_duration=None, duration_t
     return power_trefs, power_off_events
 
 
-def _get_opto_on_off_times(bs, opsin):
-    """Return (on_times, off_times) arrays for all opto pulses of the given opsin."""
-    metadata = bs.metadata
-    events = metadata[metadata['event'].str.contains(opsin, case=False, na=False)]
-    events = events[~events['event'].str.contains('trace', na=False)]
-    on_rows = events[events['event'].str.contains('_on', na=False)]
-    off_rows = events[events['event'].str.contains('_off', na=False)]
+def _pulse_intervals(power_trefs, power_off_events):
+    """(on, off, power) arrays of every pulse in an opsin's raster, sorted by onset.
 
-    def _collect(rows):
-        times = []
-        for idx in rows.index:
-            ts = bs[idx]
-            times.extend(ts.t.tolist() if hasattr(ts, 't') else ts.index.tolist())
-        return np.array(sorted(times))
-
-    return _collect(on_rows), _collect(off_rows)
-
-
-def _precompute_opto_waveforms(analyzer, bs, opsins):
+    Built from the same (power, Ts) pairs the raster draws, so the waveforms shown under
+    a raster come from exactly the pulses in it -- including any stim_duration filter
+    the caller applied -- rather than from every event with the opsin's name.
     """
-    For each unit, extract peak-channel waveforms that fall during opto-on
-    intervals per opsin, using the pre-extracted random-spike waveforms.
+    on, off, pw = [], [], []
+    for (power, tref), (_, off_ts) in zip(power_trefs, power_off_events):
+        if off_ts is None:
+            continue
+        n = min(len(tref.t), len(off_ts.t))
+        on.append(tref.t[:n])
+        off.append(off_ts.t[:n])
+        pw.append(np.full(n, power))
+    if not on:
+        return np.array([]), np.array([]), np.array([])
+    on, off, pw = np.concatenate(on), np.concatenate(off), np.concatenate(pw)
+    order = np.argsort(on)
+    return on[order], off[order], pw[order]
 
-    To increase the number of waveforms shown, recompute the waveforms
-    extension with a larger max_spikes_per_unit (e.g. 2000+).
 
-    Returns dict: {unit_id: {opsin: ndarray (n_spikes, n_samples) or None}}
+def _in_pulse(times, on, off):
+    """Index of the pulse each time falls in (on <= t <= off), or -1. Pulses must not overlap."""
+    k = np.searchsorted(on, times, side='right') - 1
+    inside = (k >= 0) & (times <= off[np.clip(k, 0, None)])
+    return np.where(inside, k, -1)
+
+
+def _precompute_opto_waveforms(analyzer, opsin_data, every_spike=True, **job_kwargs):
+    """Peak-channel waveforms of the spikes fired during each opsin's pulses.
+
+    every_spike=True reads every such spike straight from the analyzer's recording.
+    The analyzer's own waveforms extension only holds its random_spikes subsample
+    (max_spikes_per_unit, 500 by default, drawn across the whole session), so the
+    handful of those that happen to fall inside a pulse is a tiny, arbitrary share of
+    what the light actually evoked. Extracting just the in-pulse spikes, one channel per
+    unit, costs a few hundred MB at most where recomputing the extension with
+    method='all' would hold every spike of the session on every sparse channel.
+    Falls back to the subsample, with a warning, when the recording is not reachable.
+
+    The window and dtype follow the waveforms extension, so the two agree; the
+    channel is each unit's template extremum.
+
+    Returns ({unit_id: {opsin: (waveforms (n, n_samples) uV, powers (n,)) or None}},
+             t_ms) -- t_ms is the waveform time axis relative to the spike.
     """
-    waveforms_ext = analyzer.get_extension('waveforms')
-    rsp_indices = analyzer.get_extension('random_spikes').get_data()
-    spk_vec = analyzer.sorting.to_spike_vector()
+    from spikeinterface.core import get_template_extremum_channel
+    from spikeinterface.core.waveform_tools import extract_waveforms_to_single_buffer
+
     fs = analyzer.sampling_frequency
-    unit_ids = analyzer.unit_ids
+    unit_ids = list(analyzer.unit_ids)
+    wf_ext = analyzer.get_extension('waveforms')
+    params = wf_ext.params if wf_ext is not None else {'ms_before': 1.0, 'ms_after': 2.0}
+    nbefore = int(round(params['ms_before'] * fs / 1000.0))
+    nafter = int(round(params['ms_after'] * fs / 1000.0))
+    t_ms = (np.arange(nbefore + nafter) - nbefore) / fs * 1000.0
+    peak = get_template_extremum_channel(analyzer, outputs='index')
 
-    opsin_intervals = {opsin: _get_opto_on_off_times(bs, opsin) for opsin in opsins}
+    spikes = analyzer.sorting.to_spike_vector()
+    if every_spike and not analyzer.has_recording():
+        print('  opto waveforms: analyzer has no recording attached, falling back to '
+              'the random_spikes subsample')
+        every_spike = False
+    if not every_spike:
+        pick = analyzer.get_extension('random_spikes').get_data()
+        spikes = spikes[pick]
+    times = spikes['sample_index'] / fs
 
-    all_wf_data = {}
-    for unit_id in unit_ids:
-        waveforms = waveforms_ext.get_waveforms_one_unit(unit_id)  # (n_rsp, n_samples, n_ch)
-        peak_ch = int(np.argmax(np.max(np.abs(waveforms.mean(axis=0)), axis=0)))
+    # which pulse of which opsin every candidate spike falls in
+    pulses = {o: _pulse_intervals(*d) for o, d in opsin_data.items()}
+    hit = {o: _in_pulse(times, on, off) for o, (on, off, _) in pulses.items()}
+    keep = np.zeros(len(spikes), bool)
+    for k in hit.values():
+        keep |= k >= 0
 
-        unit_idx = list(unit_ids).index(unit_id)
-        in_rsp = spk_vec['unit_index'][rsp_indices] == unit_idx
-        times_s = spk_vec['sample_index'][rsp_indices[in_rsp]] / fs
+    if every_spike:
+        # one channel per unit: the buffer is (n_spikes, n_samples, 1), not 384 wide
+        mask = np.zeros((len(unit_ids), analyzer.get_num_channels()), bool)
+        mask[np.arange(len(unit_ids)), [peak[u] for u in unit_ids]] = True
+        print(f'  opto waveforms: extracting all {int(keep.sum())} in-pulse spikes')
+        buf = extract_waveforms_to_single_buffer(
+            analyzer.recording, spikes[keep], unit_ids, nbefore, nafter,
+            mode='shared_memory', return_in_uV=True, sparsity_mask=mask,
+            copy=True, job_name='opto waveforms', **job_kwargs)[:, :, 0]
+        # from here on only the in-pulse spikes matter, and buf is aligned with them
+        spikes = spikes[keep]
+        hit = {o: k[keep] for o, k in hit.items()}
+        rows = lambda u, is_unit: buf[is_unit]
+    else:
+        # a unit's subsample waveforms are stored in its spike order, which is the
+        # order its spikes appear in the (sorted) random_spikes pick -- and on the
+        # unit's sparse channels, so the peak channel is looked up among those
+        sp = analyzer.sparsity
+        col = {u: (int(np.flatnonzero(sp.unit_id_to_channel_indices[u] == peak[u])[0])
+                   if sp is not None else peak[u]) for u in unit_ids}
+        rows = lambda u, is_unit: wf_ext.get_waveforms_one_unit(u)[:, :, col[u]]
 
-        unit_wf = {}
-        for opsin in opsins:
-            on_times, off_times = opsin_intervals[opsin]
-            if len(on_times) == 0:
-                unit_wf[opsin] = None
+    all_wf_data = {u: {} for u in unit_ids}
+    for ui, u in enumerate(unit_ids):
+        is_unit = spikes['unit_index'] == ui
+        wfs_u = rows(u, is_unit) if is_unit.any() else None
+        for opsin, k in hit.items():
+            ku = k[is_unit]
+            if wfs_u is None or not (ku >= 0).any():
+                all_wf_data[u][opsin] = None
                 continue
-            mask = np.zeros(len(times_s), dtype=bool)
-            for on, off in zip(on_times, off_times):
-                mask |= (times_s >= on) & (times_s <= off)
-            selected = waveforms[mask, :, peak_ch]
-            unit_wf[opsin] = selected if len(selected) > 0 else None
+            all_wf_data[u][opsin] = (wfs_u[ku >= 0], pulses[opsin][2][ku[ku >= 0]])
+    return all_wf_data, t_ms
 
-        all_wf_data[unit_id] = unit_wf
 
-    return all_wf_data
+def _draw_opto_waveforms(ax, t_ms, entry, opsin, fontsize=8, legend=True):
+    """Every in-pulse waveform, coloured by pulse power, with their mean in black.
+
+    Power runs light-to-dark in the opsin's colormap, the same order the raster's rows
+    run, so a waveform's colour says which block of the raster it came from. The lines
+    go in as one LineCollection, which is what keeps thousands of them drawable, and
+    their alpha falls with their number so a dense bundle stays a density rather than
+    a solid block.
+    """
+    from matplotlib.collections import LineCollection
+    if entry is None:
+        ax.text(0.5, 0.5, 'no spikes during pulses', transform=ax.transAxes,
+                ha='center', va='center', color='grey', fontsize=fontsize)
+        return
+    wfs, powers = entry
+    cmap = _OPSIN_CMAPS.get(opsin, plt.cm.viridis)
+    levels = np.unique(powers)
+    shade = {p: 0.45 + 0.55 * i / max(len(levels) - 1, 1) for i, p in enumerate(levels)}
+    alpha = float(np.clip(20.0 / len(wfs), 0.02, 0.3))
+    segs = np.stack([np.broadcast_to(t_ms, wfs.shape), wfs], axis=-1)
+    ax.add_collection(LineCollection(segs, colors=[cmap(shade[p]) for p in powers],
+                                     linewidths=0.5, alpha=alpha))
+    ax.plot(t_ms, wfs.mean(axis=0), color='black', linewidth=1.5,
+            label=f'mean (n={len(wfs)})')
+    ax.autoscale_view()
+    if legend:
+        ax.legend(fontsize=fontsize, loc='upper right', frameon=False)
 
 
 def plot_opto_psth_single_unit_alt(timestamps, opsin_data, unitID,
                                     waveform_data=None, unit_label=None,
                                     save_folder=None, minmax=(-0.5, 0.5),
-                                    cdf_data=None, bars_data=None):
+                                    cdf_data=None, bars_data=None, waveform_t_ms=None):
     """
     Produces two separate figures per unit:
 
@@ -639,16 +711,9 @@ def plot_opto_psth_single_unit_alt(timestamps, opsin_data, unitID,
     # Col 0: waveforms
     for ri, opsin in enumerate(opsins[:2]):
         ax    = axs1[ri, 0]
-        wfs   = waveform_data.get(opsin) if waveform_data else None
-        color = _OPSIN_WF_COLORS.get(opsin, 'grey')
-        if wfs is not None and len(wfs) > 0:
-            t_ms = np.arange(wfs.shape[1]) / 30.0
-            for wf in wfs:
-                ax.plot(t_ms, wf, color=color, alpha=0.2, linewidth=0.5)
-            ax.plot(t_ms, wfs.mean(axis=0), color='black', linewidth=1.5)
-        else:
-            ax.text(0.5, 0.5, 'no spikes', transform=ax.transAxes,
-                    ha='center', va='center', color='grey', fontsize=8)
+        _draw_opto_waveforms(ax, waveform_t_ms,
+                             waveform_data.get(opsin) if waveform_data else None,
+                             opsin, fontsize=8, legend=False)
         ax.set_ylabel('µV', fontsize=8)
         ax.tick_params(labelsize=8)
         ax.spines['top'].set_visible(False)
@@ -789,8 +854,12 @@ def plot_opto_psth_single_unit_alt(timestamps, opsin_data, unitID,
         plt.show()
 
 
-def plot_all_opto_psth_alt(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), analyzer=None):
-    """Alternative-layout version of plot_all_opto_psth (waveforms top, raster middle, PSTH bottom)."""
+def plot_all_opto_psth_alt(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), analyzer=None,
+                           every_spike=True):
+    """Alternative-layout version of plot_all_opto_psth (waveforms top, raster middle, PSTH bottom).
+
+    every_spike: see _precompute_opto_waveforms.
+    """
     save_folder = pynapple_folder / "opto_psth_plots_alt"
     save_folder.mkdir(exist_ok=True)
 
@@ -805,10 +874,11 @@ def plot_all_opto_psth_alt(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), 
         print("No chrimson or chr2 events found with 100 ms stimulation duration; skipping.")
         return
 
-    all_wf_data = None
+    all_wf_data, wf_t_ms = None, None
     if analyzer is not None:
         print("Pre-computing opto waveforms...")
-        all_wf_data = _precompute_opto_waveforms(analyzer, bs, list(opsin_data.keys()))
+        all_wf_data, wf_t_ms = _precompute_opto_waveforms(analyzer, opsin_data,
+                                                          every_spike=every_spike)
 
     print("Pre-computing tagging data (CDF + bars)...")
     cdf_data, bars_data = _precompute_tagging_data(ephys_data, bs, list(opsin_data.keys()))
@@ -833,14 +903,17 @@ def plot_all_opto_psth_alt(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), 
             minmax=minmax,
             cdf_data=cdf_data.get(neuron),
             bars_data=bars_data.get(neuron),
+            waveform_t_ms=wf_t_ms,
         ) for neuron in ephys_data.keys()
     )
 
 
-def plot_all_opto_psth(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), analyzer=None):
+def plot_all_opto_psth(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), analyzer=None,
+                       every_spike=True):
     """
     For each unit, plot chrimson and chr2 PSTH + raster side-by-side in one
-    figure, with raster rows ordered by ascending power.
+    figure, with raster rows ordered by ascending power. With an analyzer, a row
+    under each raster shows the waveform of every spike fired during its pulses.
 
     Parameters
     ----------
@@ -853,6 +926,11 @@ def plot_all_opto_psth(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), anal
         Base folder; figures are saved under ``opto_psth_plots/``.
     minmax : tuple
         Pre/post window in seconds (default ±0.5 s).
+    analyzer : SortingAnalyzer or None
+        Source of the waveforms; without it the waveform row is left out.
+    every_spike : bool
+        True reads every in-pulse spike from the recording; False uses only the
+        analyzer's random_spikes subsample (see _precompute_opto_waveforms).
     """
     save_folder = pynapple_folder / "opto_psth_plots"
     save_folder.mkdir(exist_ok=True)
@@ -871,10 +949,11 @@ def plot_all_opto_psth(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), anal
         print("No chrimson or chr2 events found in bs.metadata; skipping opto PSTH.")
         return
 
-    all_wf_data = None
+    all_wf_data, wf_t_ms = None, None
     if analyzer is not None:
         print("Pre-computing opto waveforms...")
-        all_wf_data = _precompute_opto_waveforms(analyzer, bs, list(opsin_data.keys()))
+        all_wf_data, wf_t_ms = _precompute_opto_waveforms(analyzer, opsin_data,
+                                                          every_spike=every_spike)
 
     metadata = ephys_data.metadata
 
@@ -894,7 +973,8 @@ def plot_all_opto_psth(ephys_data, bs, pynapple_folder, minmax=(-0.5, 0.5), anal
             waveform_data=all_wf_data.get(neuron) if all_wf_data is not None else None,
             unit_label=_unit_label(neuron),
             save_folder=save_folder,
-            minmax=minmax
+            minmax=minmax,
+            waveform_t_ms=wf_t_ms,
         ) for neuron in neurons_idx
     )
 

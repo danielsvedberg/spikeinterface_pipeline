@@ -45,12 +45,14 @@ rec_CAR = si.common_reference(rec, operator="average", reference="global")
 
 job_kwargs = dict(n_jobs=-1, chunk_duration='1s', progress_bar=True)
 
-rec_CAR.save(folder=folders.sorting_path('preprocess'), format='binary', **job_kwargs)
-rec = sc.load(folders.sorting_path('preprocess'))
+#the write names its destination raw; the read after it can use the accessor, which is no longer
+#None now that the folder exists
+rec_CAR.save(folder=folders.recording_folder / fs.PREPROCESS_FOLDER, format='binary', **job_kwargs)
+rec = sc.load(folders.preprocess_folder)
 
 paramsKS4 = si.get_default_sorter_params('kilosort4')
 paramsKS4['n_jobs'] = -1
 paramsKS4['do_CAR'] = False
 
-sorting = si.run_sorter('kilosort4', rec, folder=folders.sorting_path('kilosort4_output'),
+sorting = si.run_sorter('kilosort4', rec, folder=folders.sorting_path(fs.KS_FOLDER),
                         verbose=True, **paramsKS4)

@@ -27,12 +27,21 @@ plt.rcParams.update({
 
 
 def add_all_licks(binary_signals, min_cue_latency=0.1):
-    """Combine rewarded (key 1) and early (key 2) first-lick timestamps into 'all_first_licks'.
+    """Combine the rewarded and early first-lick timestamps into 'all_first_licks'.
 
-    Licks occurring within min_cue_latency seconds of the preceding cue are excluded
-    (default 100 ms) — these are reflexive responses that precede any sensory processing."""
+    A first lick is the lick that triggered its trial's outcome (parse_nidq.parse_trials: the
+    last lick before the solenoid opening or the error tone). The two events are looked up by
+    name: by position they were keys 1 and 2, which in saved files are solenoid_off and
+    start_tone_on. Licks occurring within min_cue_latency seconds of the preceding cue are
+    excluded (default 100 ms) — these are reflexive responses that precede any sensory
+    processing."""
     bs_event_meta = binary_signals.metadata[['event']].copy()
-    all_lick_t = np.sort(np.concatenate([binary_signals[1].t, binary_signals[2].t]))
+    by_name = {e: k for k, e in zip(bs_event_meta.index, bs_event_meta['event'])}
+    missing = [e for e in ('rewarded_first_licks', 'early_first_licks') if e not in by_name]
+    if missing:
+        raise KeyError(f'binary_signals has no {missing} events')
+    all_lick_t = np.sort(np.concatenate([binary_signals[by_name['rewarded_first_licks']].t,
+                                         binary_signals[by_name['early_first_licks']].t]))
 
     cue_rows = bs_event_meta[bs_event_meta['event'] == 'start_cues']
     if len(cue_rows) > 0:
@@ -963,6 +972,9 @@ def plot_cue_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None
         )
 
     n_tranches  = len(tranche_order)
+    if n_tranches == 0:  # e.g. a single session whose lick-modulated units include no SPN
+        print("plot_cue_outcome_heatmap: no units to plot; skipping.")
+        return None
     row_heights = [len(tranche_groups[t]) * 0.03 for t in tranche_order]
 
     fig, axs = plt.subplots(n_tranches, 2,
@@ -1256,14 +1268,17 @@ def plot_spn_cue_aligned_nostim(ephys, binary_signals, trial_events,
     mean_lats  = [lats[q_assign == q].mean() for q in range(n_quintiles)]
 
     # trial-by-trial dSPN − iSPN difference
-    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])])
-    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])])
+    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])], dtype=int)
+    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])], dtype=int)
     has_diff   = len(dspn_cols) > 0 and len(ispn_cols) > 0
     if has_diff:
         trial_diff = (trial_fr_z[:, :, dspn_cols].mean(axis=2) -
                       trial_fr_z[:, :, ispn_cols].mean(axis=2))  # (n_trials, n_bins)
 
     n_rows = len(tranche_order) + (1 if has_diff else 0)
+    if n_rows == 0:  # e.g. a single session whose lick-modulated units include no SPN
+        print("plot_spn_cue_aligned_nostim: no dSPN or iSPN units; skipping.")
+        return None
     fig, axs = plt.subplots(n_rows, 1, figsize=(1, n_rows), sharex=True, squeeze=False)
 
     for ri, tranche in enumerate(tranche_order):
@@ -1431,8 +1446,8 @@ def plot_spn_mean_psth(ephys, binary_signals, trial_events,
         if label is not None:
             tranche_units.setdefault(label, []).append(u)
 
-    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])])
-    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])])
+    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])], dtype=int)
+    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])], dtype=int)
     has_diff   = len(dspn_cols) > 0 and len(ispn_cols) > 0
 
     # Per-alignment population means and diff
@@ -1517,6 +1532,13 @@ def plot_spn_mean_psth(ephys, binary_signals, trial_events,
         fig.savefig(save_path.parent / (save_path.stem + fsuffix + '.png'), dpi=150, bbox_inches='tight')
 
     return fig
+
+
+def _spn_rows(dspn_cols, ispn_cols):
+    """The rows of a dSPN / iSPN / difference figure: the cell types present, and their
+    difference when both are. A single session can lack one type altogether."""
+    rows = [c for c, cols in (('dSPN', dspn_cols), ('iSPN', ispn_cols)) if len(cols)]
+    return rows + (['dSPN-iSPN'] if len(rows) == 2 else [])
 
 
 def plot_spn_rew_unrew_psth(ephys, binary_signals, trial_events,
@@ -1609,8 +1631,8 @@ def plot_spn_rew_unrew_psth(ephys, binary_signals, trial_events,
         if label is not None:
             tranche_units.setdefault(label, []).append(u)
 
-    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])])
-    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])])
+    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])], dtype=int)
+    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])], dtype=int)
     has_diff   = len(dspn_cols) > 0 and len(ispn_cols) > 0
 
     def _stats(fr, cols, idx):
@@ -1630,7 +1652,10 @@ def plot_spn_rew_unrew_psth(ephys, binary_signals, trial_events,
         ('rewarded',   rew_idx,   'green',  'Rewarded'),
         ('unrewarded', unrew_idx, 'maroon', 'Unrewarded'),
     ]
-    row_labels = ['dSPN', 'iSPN'] + (['dSPN-iSPN'] if has_diff else [])
+    row_labels = _spn_rows(dspn_cols, ispn_cols)
+    if not row_labels:
+        print("No dSPN or iSPN units; skipping.")
+        return None
     n_rows = len(row_labels)
 
     fig, axs = plt.subplots(n_rows, 2, figsize=(2, n_rows),
@@ -1822,11 +1847,14 @@ def plot_spn_summary(ephys, binary_signals, trial_events,
         lbl = _get_classif(u)
         if lbl is not None:
             tranche_units.setdefault(lbl, []).append(u)
-    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])])
-    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])])
+    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])], dtype=int)
+    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])], dtype=int)
     has_diff   = len(dspn_cols) > 0 and len(ispn_cols) > 0
 
-    row_labels = ['dSPN', 'iSPN'] + (['dSPN-iSPN'] if has_diff else [])
+    row_labels = _spn_rows(dspn_cols, ispn_cols)
+    if not row_labels:
+        print("No dSPN or iSPN units; skipping.")
+        return None
     n_rows     = len(row_labels)
 
     def _stats(fr, cols, idx):
@@ -2835,11 +2863,14 @@ def plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, save_path=None,
         if lbl is not None:
             tranche_units.setdefault(lbl, []).append(u)
 
-    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])])
-    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])])
+    dspn_cols = np.array([u2col[u] for u in tranche_units.get('dSPN', [])], dtype=int)
+    ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])], dtype=int)
     has_diff   = len(dspn_cols) > 0 and len(ispn_cols) > 0
 
-    row_labels = ['dSPN', 'iSPN'] + (['dSPN-iSPN'] if has_diff else [])
+    row_labels = _spn_rows(dspn_cols, ispn_cols)
+    if not row_labels:
+        print("No dSPN or iSPN units; skipping.")
+        return None
     n_rows     = len(row_labels)
 
     def _stats(cols):
@@ -2906,3 +2937,366 @@ def plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, save_path=None,
         fig.savefig(save_path.parent / (save_path.stem + fsuffix + '.png'), dpi=150, bbox_inches='tight')
 
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Cross-recording validation plots
+# ---------------------------------------------------------------------------
+
+# Category order for validation plots. Unlike the _get_classif helpers used by the
+# PSTH/heatmap functions (which collapse everything that is not dSPN/iSPN), these
+# keep muSPN as its own category — the whole point of a breakdown plot is to show
+# where units actually land.
+_CATEGORY_ORDER = ('dSPN', 'iSPN', 'muSPN', 'untagged')
+_BEESWARM_MARKERS = ('o', 's', '^', 'D', 'v', 'P', 'X', '*', '<', '>')
+
+
+def _session_label(session):
+    """Coerce a SessionPaths / Path / str into a rec-ID string like 'DS15_20260702'."""
+    if hasattr(session, 'rec_ID'):
+        return session.rec_ID.name
+    return Path(str(session)).name
+
+
+def _session_ephys(session):
+    """Accept either a (ephys, binary_signals, trial_events) tuple or a bare TsGroup."""
+    return session[0] if isinstance(session, (tuple, list)) else session
+
+
+# npz round-trips have no NA type, so a missing final_classif can come back as the
+# string 'nan' / '<NA>' / 'None' rather than pd.NA. Catch those too, otherwise the
+# untagged units silently split into a separate bar named 'nan'.
+_NA_STRINGS = {'', 'nan', 'none', 'na', '<na>', 'null'}
+
+
+def _unit_category(emeta, unit, untagged='untagged'):
+    """Category of one unit, preserving muSPN; missing/NA final_classif -> 'untagged'.
+
+    'untagged' is not the same group as the 'Unlabeled' tranche the PSTH/heatmap
+    functions use: those lump muSPN in with the untagged, this keeps them apart."""
+    if 'final_classif' not in emeta.columns or unit not in emeta.index:
+        return untagged
+    c = emeta.loc[unit, 'final_classif']
+    if c is None or pd.isna(c) or str(c).strip().lower() in _NA_STRINGS:
+        return untagged
+    return str(c)
+
+
+def _order_categories(present):
+    """Known categories first in _CATEGORY_ORDER, then anything unexpected, alphabetically."""
+    known = [c for c in _CATEGORY_ORDER if c in present]
+    return known + sorted(c for c in present if c not in _CATEGORY_ORDER)
+
+
+def _bootstrap_ci(values, n_boot=10000, ci=(2.5, 97.5), seed=42):
+    """Percentile bootstrap CI of the mean. Returns (lo, hi); (nan, nan) if empty."""
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        return np.nan, np.nan
+    if len(vals) == 1:
+        return float(vals[0]), float(vals[0])
+    rng = np.random.default_rng(seed)
+    boot = rng.choice(vals, size=(n_boot, len(vals)), replace=True).mean(axis=1)
+    return float(np.percentile(boot, ci[0])), float(np.percentile(boot, ci[1]))
+
+
+def _asym_yerr(mean, lo, hi):
+    """Bootstrap CI as a (2, 1) yerr array, clipped at zero so matplotlib never errors."""
+    if not np.isfinite(mean) or not np.isfinite(lo) or not np.isfinite(hi):
+        return np.zeros((2, 1))
+    return np.array([[max(mean - lo, 0.0)], [max(hi - mean, 0.0)]])
+
+
+def _animal_session_style(session_labels):
+    """Map rec IDs to a colour (per animal, the DS## prefix) and a marker (per recording).
+
+    Returns (uniq_animals, animal_of, color_of_animal, color_of, marker_of)."""
+    animals = [lab.split('_')[0] for lab in session_labels]
+    uniq_animals = list(dict.fromkeys(animals))
+    cmap = plt.get_cmap('tab10')
+    color_of_animal = {a: cmap(i % 10) for i, a in enumerate(uniq_animals)}
+    animal_of = dict(zip(session_labels, animals))
+    color_of = {lab: color_of_animal[an] for lab, an in animal_of.items()}
+    marker_of = {lab: _BEESWARM_MARKERS[i % len(_BEESWARM_MARKERS)]
+                 for i, lab in enumerate(session_labels)}
+    return uniq_animals, animal_of, color_of_animal, color_of, marker_of
+
+
+def _beeswarm_offsets(values, width=0.30, n_bins=40):
+    """Deterministic beeswarm x-offsets: bin by value, fan each bin out symmetrically."""
+    values = np.asarray(values, dtype=float)
+    offsets = np.zeros(len(values))
+    finite = np.isfinite(values)
+    if not finite.any():
+        return offsets
+    v = values[finite]
+    lo, hi = v.min(), v.max()
+    if hi > lo:
+        bins = np.minimum(((v - lo) / (hi - lo) * n_bins).astype(int), n_bins - 1)
+    else:
+        bins = np.zeros(len(v), dtype=int)
+    off = np.zeros(len(v))
+    for b in np.unique(bins):
+        idx = np.flatnonzero(bins == b)
+        n = len(idx)
+        off[idx] = (np.arange(n) - (n - 1) / 2.0) * (2.0 * width / n)
+    offsets[finite] = off
+    return offsets
+
+
+def _style_legend(ax, animal_colors, marker_labels=None, max_rows=6):
+    """Proxy-handle legend: one entry per animal (colour) and optionally per recording (shape).
+
+    Built from proxies rather than the scatter calls, which would give one duplicate
+    entry per point. Recording handles wrap into extra columns past max_rows so a
+    long session list does not run off the bottom of the panel."""
+    from matplotlib.lines import Line2D
+    animal_handles = [Line2D([], [], marker='o', linestyle='none', markersize=4,
+                             markerfacecolor=c, markeredgecolor='k',
+                             markeredgewidth=0.3, label=a)
+                      for a, c in animal_colors.items()]
+    ax.legend(handles=animal_handles, loc='upper left', bbox_to_anchor=(1.02, 1.0),
+              frameon=False, fontsize=6, handletextpad=0.4, labelspacing=0.3,
+              borderaxespad=0.0)
+    if not marker_labels:
+        return
+    rec_handles = [Line2D([], [], marker=m, linestyle='none', markersize=4,
+                          markerfacecolor='none', markeredgecolor='k',
+                          markeredgewidth=0.5, label=lab)
+                   for lab, m in marker_labels.items()]
+    ncol = int(np.ceil(len(rec_handles) / max_rows))
+    ax.add_artist(ax.get_legend())
+    ax.legend(handles=rec_handles, loc='lower left', bbox_to_anchor=(1.02, 0.0),
+              frameon=False, fontsize=6, handletextpad=0.4, labelspacing=0.3,
+              borderaxespad=0.0, ncol=ncol, columnspacing=0.8)
+
+
+def unit_category_counts(sessions, session_labels=None):
+    """Dense recordings x categories count table (explicit zeros).
+
+    sessions: the pre-merge list of (ephys, binary_signals, trial_events) tuples
+    (bare TsGroups also accepted). Counts reflect whatever unit selection the
+    caller already applied — in the compendium script that is the lick-bout
+    modulated subset, not every sorted unit.
+
+    session_labels: rec IDs ('DS15_20260702'); SessionPaths objects are accepted
+    and coerced. Defaults to session_00, session_01, ... if omitted.
+    """
+    if session_labels is None:
+        labels = [f'session_{i:02d}' for i in range(len(sessions))]
+    else:
+        labels = [_session_label(s) for s in session_labels]
+    if len(labels) != len(sessions):
+        raise ValueError(f'{len(labels)} session_labels for {len(sessions)} sessions')
+
+    per_session = []
+    for sess in sessions:
+        ep = _session_ephys(sess)
+        emeta = ep.metadata
+        cats = [_unit_category(emeta, u) for u in ep.keys()]
+        per_session.append(pd.Series(cats).value_counts())
+
+    categories = _order_categories({c for s in per_session for c in s.index})
+    counts = pd.DataFrame(0, index=labels, columns=categories, dtype=int)
+    for lab, s in zip(labels, per_session):
+        for cat, n in s.items():
+            counts.loc[lab, cat] = int(n)
+    counts.index.name = 'recording'
+    return counts
+
+
+def unit_firing_rates(sessions, session_labels=None):
+    """Session-wide mean firing rate per unit, as a tidy DataFrame.
+
+    Rate is n_spikes / (total duration of that session's time_support) — the whole
+    recording, with no task-period or opto restriction. Because each session is
+    handled before merge_sessions, the denominator is that session's own duration
+    (the merged pseudo-session's support spans every recording, so rates computed
+    after merging would be wrong).
+
+    Columns: recording, animal, unit, category, n_spikes, duration_s, rate_hz.
+    """
+    if session_labels is None:
+        labels = [f'session_{i:02d}' for i in range(len(sessions))]
+    else:
+        labels = [_session_label(s) for s in session_labels]
+    if len(labels) != len(sessions):
+        raise ValueError(f'{len(labels)} session_labels for {len(sessions)} sessions')
+
+    rows = []
+    for lab, sess in zip(labels, sessions):
+        ep = _session_ephys(sess)
+        emeta = ep.metadata
+        ts = ep.time_support
+        duration = float(np.sum(np.asarray(ts.end) - np.asarray(ts.start)))
+        for u in ep.keys():
+            n_spk = len(ep[u])
+            rows.append({
+                'recording': lab,
+                'animal': lab.split('_')[0],
+                'unit': u,
+                'category': _unit_category(emeta, u),
+                'n_spikes': n_spk,
+                'duration_s': duration,
+                'rate_hz': n_spk / duration if duration > 0 else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
+def plot_units_per_category(sessions, session_labels=None, save_path=None,
+                            n_boot=10000, seed=42, panel_width=1.8, panel_height=1.0):
+    """Validation 1: units per category per recording.
+
+    Bar = mean count across recordings; error bars = bootstrapped 95% CI of that
+    mean (2.5th / 97.5th percentiles of n_boot resamples of the recordings).
+    Each recording contributes one circle in a beeswarm, coloured by animal.
+
+    Counts come from unit_category_counts, so they reflect the unit selection the
+    caller already applied (the lick-bout modulated subset in compendium_plots).
+
+    Returns (fig, counts_df).
+    """
+    counts = unit_category_counts(sessions, session_labels)
+    labels = list(counts.index)
+    categories = list(counts.columns)
+    _, animal_of, animal_colors, color_of, _ = _animal_session_style(labels)
+
+    x = np.arange(len(categories))
+    means, cis = [], []
+    for cat in categories:
+        vals = counts[cat].to_numpy(dtype=float)
+        means.append(float(vals.mean()))
+        cis.append(_bootstrap_ci(vals, n_boot=n_boot, seed=seed))
+
+    fig, ax = plt.subplots(figsize=(panel_width, panel_height))
+    ax.bar(x, means, width=0.6, color='lightgrey', edgecolor='k',
+           linewidth=0.5, zorder=1)
+    for xi, m, (lo, hi) in zip(x, means, cis):
+        ax.errorbar(xi, m, yerr=_asym_yerr(m, lo, hi), fmt='none',
+                    ecolor='k', elinewidth=0.8, capsize=2, zorder=3)
+
+    for ci_, cat in enumerate(categories):
+        vals = counts[cat].to_numpy(dtype=float)
+        offs = _beeswarm_offsets(vals)
+        for lab, v, off in zip(labels, vals, offs):
+            ax.scatter(ci_ + off, v, marker='o', s=10, facecolor=color_of[lab],
+                       edgecolor='k', linewidths=0.3, zorder=5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories, fontsize=8, rotation=30, ha='right')
+    ax.set_ylabel('Units per recording', fontsize=8)
+    ax.set_ylim(bottom=0)
+    ax.tick_params(labelsize=8)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    _style_legend(ax, animal_colors)
+
+    psu.adjust_figure_for_panel_size_auto(fig, panel_width=panel_width,
+                                          panel_height=panel_height)
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        txt = [f'Units per category per recording (n={len(labels)} recordings, '
+               f'{len(set(animal_of.values()))} animals)',
+               'Bar = mean across recordings; error bars = bootstrapped 95% CI '
+               f'(2.5/97.5 pct, n_boot={n_boot}, seed={seed})', '']
+        for cat, m, (lo, hi) in zip(categories, means, cis):
+            txt.append(f'{cat}: mean={m:.2f} [{lo:.2f}, {hi:.2f}], '
+                       f'total={int(counts[cat].sum())}')
+        txt += ['', 'Per-recording counts:', counts.to_string()]
+        (save_path.parent / (save_path.stem + '.txt')).write_text('\n'.join(txt))
+        fig.savefig(save_path.parent / (save_path.stem + '.svg'), bbox_inches='tight')
+        fig.savefig(save_path.parent / (save_path.stem + '.png'), dpi=150,
+                    bbox_inches='tight')
+
+    return fig, counts
+
+
+def plot_firing_rate_by_category(sessions, session_labels=None, save_path=None,
+                                 n_boot=10000, seed=42, ymax_pct=100,
+                                 panel_width=2.0, panel_height=1.0):
+    """Validation 2: session-wide mean firing rate per unit, by category.
+
+    Bar = mean rate across units in the category; error bars = bootstrapped 95% CI
+    of that mean (2.5th / 97.5th percentiles of n_boot resamples of the units).
+    Every unit is one beeswarm marker: colour = animal, marker shape = recording.
+
+    Rate is over the full session support, with no task-period or opto restriction
+    (see unit_firing_rates).
+
+    ymax_pct: cap the y-axis at this percentile of rates so a few very fast units
+    do not flatten the rest (100, the default, shows every unit). Units above the
+    cap are drawn outside the axes and so are not visible — the sidecar .txt always
+    reports the true n and mean.
+
+    Returns (fig, rates_df).
+    """
+    rates = unit_firing_rates(sessions, session_labels)
+    if rates.empty:
+        raise ValueError('no units found in the supplied sessions')
+
+    labels = list(dict.fromkeys(rates['recording']))
+    categories = _order_categories(set(rates['category']))
+    _, animal_of, animal_colors, color_of, marker_of = _animal_session_style(labels)
+
+    x = np.arange(len(categories))
+    means, cis, ns = [], [], []
+    for cat in categories:
+        vals = rates.loc[rates['category'] == cat, 'rate_hz'].to_numpy(dtype=float)
+        ns.append(len(vals))
+        means.append(float(np.nanmean(vals)) if len(vals) else np.nan)
+        cis.append(_bootstrap_ci(vals, n_boot=n_boot, seed=seed))
+
+    fig, ax = plt.subplots(figsize=(panel_width, panel_height))
+    ax.bar(x, means, width=0.6, color='lightgrey', edgecolor='k',
+           linewidth=0.5, zorder=1)
+    for xi, m, (lo, hi) in zip(x, means, cis):
+        ax.errorbar(xi, m, yerr=_asym_yerr(m, lo, hi), fmt='none',
+                    ecolor='k', elinewidth=0.8, capsize=2, zorder=3)
+
+    for ci_, cat in enumerate(categories):
+        sub = rates[rates['category'] == cat]
+        vals = sub['rate_hz'].to_numpy(dtype=float)
+        offs = _beeswarm_offsets(vals)
+        for rec in labels:
+            m = (sub['recording'] == rec).to_numpy()
+            if not m.any():
+                continue
+            ax.scatter(ci_ + offs[m], vals[m], marker=marker_of[rec], s=6,
+                       facecolor=color_of[rec], edgecolor='k', linewidths=0.2,
+                       alpha=0.8, zorder=5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'{c}\nn={n}' for c, n in zip(categories, ns)], fontsize=8)
+    ax.set_ylabel('Session-wide\nFR (spks/s)', fontsize=8)
+    top = float(np.nanpercentile(rates['rate_hz'], ymax_pct)) if ymax_pct < 100 \
+        else float(np.nanmax(rates['rate_hz']))
+    ax.set_ylim(0, top * 1.05 if np.isfinite(top) and top > 0 else None)
+    ax.tick_params(labelsize=8)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    _style_legend(ax, animal_colors, marker_of)
+
+    psu.adjust_figure_for_panel_size_auto(fig, panel_width=panel_width,
+                                          panel_height=panel_height)
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        txt = [f'Session-wide firing rate by category '
+               f'(n={len(rates)} units, {len(labels)} recordings, '
+               f'{len(set(animal_of.values()))} animals)',
+               'Bar = mean across units; error bars = bootstrapped 95% CI '
+               f'(2.5/97.5 pct, n_boot={n_boot}, seed={seed})',
+               'Rate = n_spikes / total time_support duration of that session', '']
+        for cat, m, (lo, hi), n in zip(categories, means, cis, ns):
+            txt.append(f'{cat}: n={n}, mean={m:.3f} Hz [{lo:.3f}, {hi:.3f}]')
+        txt += ['', 'Per-recording durations (s):']
+        dur = rates.groupby('recording')['duration_s'].first()
+        txt += [f'  {rec}: {d:.1f}' for rec, d in dur.items()]
+        (save_path.parent / (save_path.stem + '.txt')).write_text('\n'.join(txt))
+        fig.savefig(save_path.parent / (save_path.stem + '.svg'), bbox_inches='tight')
+        fig.savefig(save_path.parent / (save_path.stem + '.png'), dpi=150,
+                    bbox_inches='tight')
+
+    return fig, rates

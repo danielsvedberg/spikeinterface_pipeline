@@ -5,9 +5,10 @@ Every session is identified by a rec_ID (e.g. DS15/DS15_20260701, i.e. an_ID/ses
 mirrored under three sibling category roots inside one root_folder:
 
 root_folder/
-├── recording_files/DS15/DS15_20260701/   <- raw acquisition data only (_g# folders, csv/avi/mat/txt,
-│                                            .rhd folders, nidaq_map.txt / intan_map.txt)
-├── sorting_files/DS15/DS15_20260701/     <- preprocess, kilosort4_output, analyzer*, sorting_summary*,
+├── recording_files/DS15/DS15_20260701/   <- acquisition data (_g# folders, csv/avi/mat/txt, .rhd
+│                                            folders, nidaq_map.txt / intan_map.txt) plus preprocess/,
+│                                            which is a filtered rendering of that same raw signal
+├── sorting_files/DS15/DS15_20260701/     <- kilosort4_output, analyzer*, sorting_summary*,
 │                                            binary_signals/binary_signals.npz (copy)
 └── analysis_files/DS15/DS15_20260701/    <- pynapple/ (curation products, event tables, plots),
                                              binary_signals/binary_signals.npz (primary)
@@ -15,10 +16,13 @@ root_folder/
 SessionPaths is the accessor for all of it: given any one of a session's three category folders it
 returns every other path the pipeline needs, folders and individual files alike (analysis_folder,
 pynapple_folder, binary_signals_file(), sorting_path(...), input_map, spikeglx_folder(), ...).
-Programs are handed a rec_folder (any category's copy of the session) and resolve the rest from it,
-so raw data is always read from recording_files while products are always written to
-sorting_files/analysis_files. file_moving.py uses the same definitions to relocate legacy sessions
-that still keep everything inside rec_folder.
+Programs are handed a session folder (any category's copy of the session) and resolve the rest from
+it, so raw data is always read from recording_files while products are always written to
+sorting_files/analysis_files. Old sessions are often archived -- recording_files and sorting_files
+moved off the drive to save space, analysis_files left behind -- so posthoc programs are handed the
+analysis_folder instead and SessionPaths resolves everything that does not depend on the raw data.
+file_moving.py uses the same definitions to relocate legacy sessions that still keep everything
+inside rec_folder.
 """
 
 from pathlib import Path
@@ -32,6 +36,11 @@ ANALYSIS_ROOT = "analysis_files"
 CATEGORY_ROOTS = (RECORDING_ROOT, SORTING_ROOT, ANALYSIS_ROOT)
 
 #names of the standard products inside a session's category folders
+PREPROCESS_FOLDER = "preprocess"
+#the raw-data saturation scan's cache and report, beside preprocess rather than inside it:
+#saving the preprocessed recording with overwrite=True deletes its folder first
+SATURATION_FOLDER = "saturation"
+KS_FOLDER = "kilosort4_output"
 PYNAPPLE_FOLDER = "pynapple"
 BINARY_SIGNALS_FOLDER = "binary_signals"
 BINARY_SIGNALS_FILE = "binary_signals.npz"
@@ -40,14 +49,41 @@ BINARY_SIGNALS_FILE = "binary_signals.npz"
 #are listed and whichever a session actually has is the one SessionPaths.input_map returns
 INPUT_MAP_FILES = ("nidaq_map.txt", "intan_map.txt")
 
+#the behaviour computer's per-session log of every task event (time in Arduino ms, label), written
+#beside the raw data as <session>_eventTable.csv. preprocessing/event_table_licks.py reads its licks
+#when the NIDQ lick line was not recorded
+EVENT_TABLE_SUFFIX = "_eventTable.csv"
+
 #which of a legacy rec_folder's subfolders belong to which category (used by file_moving.py, and
-#kept here so the pipeline's write locations and the mover's expectations cannot drift apart)
-SORTING_SUBFOLDER_PREFIXES = ("analyzer", "sorting_summary", "kilosort", "preprocess")
+#kept here so the pipeline's write locations and the mover's expectations cannot drift apart).
+#preprocess is deliberately absent: it belongs to recording_files, which is where a legacy
+#rec_folder already keeps it, so the mover leaves it exactly where it is
+SORTING_SUBFOLDER_PREFIXES = ("analyzer", "sorting_summary", "kilosort")
 ANALYSIS_SUBFOLDER_PREFIXES = (PYNAPPLE_FOLDER,)
 
 #an_ID-level analysis products: folders that sit beside the session folders and span several
 #sessions of one animal, so they belong under analysis_files/<an_ID>/ rather than any one session
 SUBJECT_ANALYSIS_SUBFOLDER_PREFIXES = ("compendium",)
+
+#folders whose name contains any of these are off limits to the movers -- not moved, not scanned,
+#not reported on. Kept here beside the layout itself so every program that relocates files obeys
+#the same rule; pass skip_substrings=() to any mover to turn it off
+SKIP_SUBSTRINGS = ("hidden", "ignore")
+
+
+def skip_reason(names, skip_substrings=SKIP_SUBSTRINGS):
+    """The first skip substring found in any of `names`, or None if none of them match.
+
+    Matching is case-insensitive. Callers hand it the path components below the category root
+    -- rec_ID.parts, or a single subfolder name -- so a marked animal folder excludes everything
+    under it while a root folder that happens to contain the word is fine.
+    """
+    for name in names:
+        lowered = str(name).lower()
+        for substring in skip_substrings:
+            if substring.lower() in lowered:
+                return substring
+    return None
 
 
 def split_category_path(folder):
@@ -113,44 +149,72 @@ def find_imec_folder(spikeglx_folder, fail_quietly=False):
 class SessionPaths:
     """Every path belonging to one recording session -- folders and individual files alike.
 
-    Construct it from any of the session's three category folders (normally the raw rec_folder);
-    every other location is derived, so no caller needs to know the layout.
+    Construct it from any of the session's three category folders -- normally the raw rec_folder,
+    but the analysis_folder does just as well; every other location is derived from the rec_ID,
+    not from the folder handed in, so no caller needs to know the layout.
 
     The sorting and analysis folders report what is actually on disk, and the two kinds of
     accessor answer a missing one differently:
 
       * FOLDER accessors -- sorting_folder, analysis_folder, sorting_path, analysis_path,
-        pynapple_folder, binary_signals_folder -- return None. "Has this session been sorted
-        yet?" is then a question you can ask the object, rather than one every caller answers
-        with its own .exists() call.
+        pynapple_folder, binary_signals_folder, preprocess_folder, ks_folder -- return None.
+        "Has this session been sorted yet?" is then a question you can ask the object, rather
+        than one every caller answers with its own .exists() call.
       * FILE accessors -- binary_signals_file -- raise FileNotFoundError instead. They are asked
         for something to open, and None is never a useful answer to that: it defers the failure
         to whatever tries to read it, which then reports a TypeError about NoneType and says
         nothing about which session or which stage is missing.
 
     Pass create=True to have the folders made at construction, after which they exist and every
-    accessor returns a path.
+    accessor returns a path -- except the two product accessors noted below, preprocess_folder
+    and ks_folder, which stay None until the stage that fills them has actually run.
 
-    recording_folder is deliberately not treated that way: a session with no raw data is an
-    error rather than a not-yet state, so it always returns its path.
+    recording_folder is deliberately not treated that way: it always returns its path, never
+    None. There is no not-yet state for raw data, and the accessors above it -- preprocess_folder,
+    input_map -- read it as a path, so a None would only resurface as the TypeError this design
+    exists to avoid.
 
-    To name a destination that does not exist yet and should NOT be created -- what
-    file_moving.py needs -- use the module-level category_path() instead of this class.
+    That path can still be absent, though, and legitimately so: an ARCHIVED session is one whose
+    recording_files (and normally sorting_files with it) have been moved off this drive to
+    reclaim space, leaving analysis_files behind. Such a session is built from its analysis_folder
+    and everything not derived from the raw data keeps working -- analysis_path, pynapple_folder,
+    binary_signals_file() -- while preprocess_folder and input_map return None and the
+    raw-acquisition accessors raise, naming the folder that is gone. has_recording is the question
+    to ask about it, and it is what stops create=True from rebuilding the sorting tree that was
+    deleted; see _creatable.
+
+    preprocess_folder is the exception to create=True: it stays None until something has
+    actually been preprocessed, however this object was built, because creating it empty is not
+    a harmless head start -- SpikeInterface's recording.save(folder=...) refuses to write into a
+    folder that already exists, so pre-making it would break the very step that fills it.
+
+    preprocess_folder and ks_folder are also the two accessors that check for the product itself
+    rather than for the category folder around it, because in both cases that folder is always
+    there by the time anyone asks -- recording_folder never has a not-yet state, and the sorting
+    folder is normally made up front by create_output_folders. Testing the category folder would
+    make `is None` answer "does this session have somewhere to put a sorting?" when what the
+    caller means is "has this session been sorted?".
+
+    To name a destination that does not exist yet and should NOT be created -- what a writer
+    needs, and what file_moving.py needs -- use the module-level category_path(),
+    recording_folder / PREPROCESS_FOLDER for the preprocess case, or sorting_path(KS_FOLDER)
+    for the sorting one.
 
     The other members that touch the filesystem are the ones whose name is not fixed by the
     layout: spikeglx_folder and imec_folder raise when there is nothing to find, and input_map
     returns None when the session has no channel map.
     """
 
-    def __init__(self, rec_folder, create=False):
+    def __init__(self, session_folder, create=False):
         #the folder this object was built from, kept as handed in. it is whichever category's copy
-        #the caller happened to have, so it is the right thing to quote back in a message but not
-        #the right thing to read raw data from -- use recording_folder for that
-        self.base_folder = Path(rec_folder)
+        #the caller happened to have -- a rec_folder normally, an analysis_folder for an archived
+        #session -- so it is the right thing to quote back in a message but not the right thing to
+        #read raw data from; use recording_folder for that
+        self.base_folder = Path(session_folder)
         self.root_folder, _, self.rec_ID = split_category_path(self.base_folder)
         if not self.rec_ID.parts:
             raise ValueError(
-                f"{rec_folder} names a category root but no session below it; expected "
+                f"{session_folder} names a category root but no session below it; expected "
                 f"<root_folder>/{RECORDING_ROOT}/<an_ID>/<rec_ID>."
             )
         self.an_ID = self.rec_ID.parts[0]
@@ -160,8 +224,10 @@ class SessionPaths:
 
     def __repr__(self):
         made = [c for c in (SORTING_ROOT, ANALYSIS_ROOT) if self._raw_category_folder(c).is_dir()]
-        return (f"SessionPaths({self.rec_ID.as_posix()} under {self.root_folder}; "
-                f"{', '.join(made) if made else 'no outputs yet'})")
+        state = ', '.join(made) if made else 'no outputs yet'
+        if not self.has_recording:
+            state += '; archived, no raw data'
+        return f"SessionPaths({self.rec_ID.as_posix()} under {self.root_folder}; {state})"
 
     def _raw_category_folder(self, category):
         """Where a category's folder would be, whether or not anything is there."""
@@ -169,16 +235,51 @@ class SessionPaths:
             raise ValueError(f"category must be one of {CATEGORY_ROOTS}, got {category}")
         return self.root_folder / category / self.rec_ID
 
+    @property
+    def has_recording(self):
+        """Whether this session's raw acquisition data is still on this drive.
+
+        False means the session has been archived -- recording_files (and normally sorting_files
+        with it) moved off to reclaim space, leaving only analysis_files behind. Everything
+        derived from the raw data is then unavailable, but the analysis products are all still
+        there, so posthoc work runs unchanged.
+        """
+        return self._raw_category_folder(RECORDING_ROOT).is_dir()
+
+    @property
+    def has_sorting(self):
+        """Whether this session's sorting outputs are still on this drive.
+
+        False either because the session has not been sorted yet or because it has been archived;
+        has_recording is what tells those apart.
+        """
+        return self._raw_category_folder(SORTING_ROOT).is_dir()
+
+    def _creatable(self, category):
+        """Whether a missing `category` folder for this session may be made on demand.
+
+        Only sorting_files is ever withheld, and only from an archived session: with the raw data
+        gone there is nothing left to sort, so making the folder would rebuild part of the very
+        tree that was deleted to reclaim the space -- and would leave behind an empty sorting
+        folder that later reads as "sorted, but the outputs vanished".
+
+        This gates creation only, never reads. A session whose recording moved out but whose
+        sorting stayed keeps working in full: category_folder returns any folder that is actually
+        there before it ever consults this, so the half-archived case needs no special casing.
+        """
+        return category != SORTING_ROOT or self.has_recording
+
     def category_folder(self, category):
         """This session's folder under the given category root, or None if it is not there yet.
 
         recording_files always comes back as a path; sorting_files and analysis_files come back
-        as None until they exist, or are created first if this object was built with create=True.
+        as None until they exist, or are created first if this object was built with create=True
+        -- except that an archived session's sorting folder is never created, see _creatable.
         """
         folder = self._raw_category_folder(category)
         if category == RECORDING_ROOT or folder.is_dir():
             return folder
-        if self.create:
+        if self.create and self._creatable(category):
             folder.mkdir(parents=True, exist_ok=True)
             return folder
         return None
@@ -197,8 +298,27 @@ class SessionPaths:
     def analysis_folder(self):
         return self.category_folder(ANALYSIS_ROOT)
 
+    @property
+    def preprocess_folder(self):
+        """The filtered copy of this session's raw signal, beside the raw data, or None if this
+        session has not been preprocessed yet.
+
+        It lives in recording_files rather than sorting_files because it is a rendering of the
+        acquisition, not a product of any one sorting run: several sortings of a session read the
+        same preprocess folder, and it stays valid when their outputs are thrown away.
+
+        Unlike the other folder accessors this one checks for the product itself rather than for
+        the category folder around it, since recording_folder is always there -- so
+        `folders.preprocess_folder is None` is the test for whether this session has been
+        preprocessed. It is also never created, not even under create=True: see the class
+        docstring for why an empty preprocess folder is worse than a missing one. A writer names
+        its destination as recording_folder / PREPROCESS_FOLDER.
+        """
+        folder = self.recording_folder / PREPROCESS_FOLDER
+        return folder if folder.is_dir() else None
+
     def sorting_path(self, *names):
-        """A named product inside this session's sorting folder, e.g. sorting_path('preprocess').
+        """A named product inside this session's sorting folder, e.g. sorting_path('analyzer').
 
         None if the session has no sorting folder, so that a missing product and a missing
         folder do not have to be distinguished by the caller.
@@ -211,6 +331,18 @@ class SessionPaths:
         folder yet."""
         folder = self.analysis_folder
         return folder.joinpath(*names) if folder is not None else None
+
+    @property
+    def ks_folder(self):
+        """This session's KiloSort output, or None if it has not been sorted yet.
+
+        Like preprocess_folder, this checks for the product rather than for the category folder
+        around it: the sorting folder is normally created up front, so `folders.ks_folder is
+        None` is the test for whether the sorter has actually run. A writer names its
+        destination as sorting_path(KS_FOLDER), which is a path whether or not it exists.
+        """
+        folder = self.sorting_path(KS_FOLDER)
+        return folder if folder is not None and folder.is_dir() else None
 
     @property
     def pynapple_folder(self):
@@ -233,6 +365,21 @@ class SessionPaths:
                 return candidate
         return None
 
+    @property
+    def event_table(self):
+        """The behaviour computer's event table for this session, beside its raw data, or None.
+
+        Named <session>_eventTable.csv; failing that, the folder's only *_eventTable.csv is taken,
+        so a session renamed after the behaviour program wrote it is still found. More than one
+        candidate and no exact name is ambiguous, and gets None rather than a guess.
+        """
+        rec_folder = self.recording_folder
+        exact = rec_folder / f"{self.rec_ID.name}{EVENT_TABLE_SUFFIX}"
+        if exact.exists():
+            return exact
+        candidates = sorted(rec_folder.glob(f"*{EVENT_TABLE_SUFFIX}"))
+        return candidates[0] if len(candidates) == 1 else None
+
     def _require_folder(self, category, wanted):
         """The category folder, or a FileNotFoundError naming what was being looked for.
 
@@ -244,11 +391,20 @@ class SessionPaths:
         """
         folder = self.category_folder(category)
         if folder is None:
+            #what to do about it differs, so say which case this is. suggesting create=True to an
+            #archived session would be advice that quietly does nothing: _creatable refuses to
+            #rebuild a sorting folder whose raw data is gone
+            if not self._creatable(category):
+                remedy = ("This session has been archived -- its raw data is gone, and its "
+                          f"{category} went with it -- so nothing can be written there. Its "
+                          f"{ANALYSIS_ROOT} products are still reachable.")
+            else:
+                remedy = ("It has probably not been through that stage of the pipeline yet; "
+                          "pass create=True to SessionPaths if you are about to write there.")
             raise FileNotFoundError(
                 f"cannot give a path to {wanted}: session {self.rec_ID.as_posix()} has no "
                 f"{category} folder ({self._raw_category_folder(category)} does not exist). "
-                f"It has probably not been through that stage of the pipeline yet; pass "
-                f"create=True to SessionPaths if you are about to write there.")
+                f"{remedy}")
         return folder
 
     def binary_signals_folder(self, category=ANALYSIS_ROOT):
@@ -277,7 +433,11 @@ class SessionPaths:
         """Every SpikeGLX run folder (ANID_g#) in this session's recording folder, sorted by name."""
         rec_folder = self.recording_folder
         if not rec_folder.is_dir():
-            raise FileNotFoundError(f"No recording folder for this session: {rec_folder}")
+            raise FileNotFoundError(
+                f"No recording folder for session {self.rec_ID.as_posix()}: {rec_folder} does "
+                f"not exist. This session has probably been archived -- its raw data moved off "
+                f"this drive -- in which case only its analysis products can be reached. Check "
+                f"folders.has_recording before asking for anything derived from the raw signal.")
         return sorted((f for f in rec_folder.iterdir() if f.is_dir() and '_g' in f.name),
                       key=lambda f: f.name)
 
@@ -315,8 +475,12 @@ class SessionPaths:
         Equivalent to having constructed with create=True; use whichever reads better at the
         call site. Goes through the raw paths, since the checked ones are None precisely when
         there is something to create.
+
+        An archived session gets only its analysis folder: see _creatable for why the sorting
+        folder is not rebuilt once the raw data it belongs to is gone.
         """
-        self._raw_category_folder(SORTING_ROOT).mkdir(parents=True, exist_ok=True)
+        if self._creatable(SORTING_ROOT):
+            self._raw_category_folder(SORTING_ROOT).mkdir(parents=True, exist_ok=True)
         self._raw_category_folder(ANALYSIS_ROOT).mkdir(parents=True, exist_ok=True)
         return self
 
@@ -336,6 +500,11 @@ class SessionPaths:
         dest = (self._raw_category_folder(SORTING_ROOT)
                 / BINARY_SIGNALS_FOLDER / BINARY_SIGNALS_FILE)
         if not source.exists():
+            return None
+        #the session folder itself, not dest.parent: a sorted session that has never had binary
+        #signals copied over is missing only the binary_signals/ subfolder and should still get
+        #it, while an archived one is missing the whole sorting folder and must not have it made
+        if not self.has_sorting:
             return None
         if dest.exists() and dest.stat().st_mtime >= source.stat().st_mtime:
             return dest
