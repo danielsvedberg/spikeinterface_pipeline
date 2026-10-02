@@ -11,7 +11,9 @@ from pathlib import Path
 from sklearn.mixture import GaussianMixture
 import ast
 import os
+import re
 from utils import file_structure as fs
+from preprocessing import event_table_licks as etl
 
 default_dinmap = {
     'licks': 0,
@@ -35,13 +37,13 @@ default_optoidx = {'chrimson': default_ints,
                    'chr2': default_ints}
 
 
-def get_nidq_aligner(imec_rec, digital_events, pulse_din=1):
+def get_nidq_aligner(sync_rec, digital_events, pulse_din=1):
 
     digchids = digital_events.channel_ids
-    imec_sync = imec_rec.select_channels([imec_rec.channel_ids[-1]])
-    imec_time = imec_sync.get_times()
+    #imec_sync = imec_rec.select_channels([imec_rec.channel_ids[-1]])
+    imec_time = sync_rec.get_times()
     imec_time = imec_time - imec_time[0]  # zeroing time
-    sync_trace = imec_sync.get_traces()
+    sync_trace = sync_rec.get_traces()
     #convert sync trace to boolean, get the min and max to define a threshold
     threshold = (np.max(sync_trace) + np.min(sync_trace)) / 2
     sync_trace_bool = sync_trace > threshold
@@ -65,12 +67,96 @@ def get_nidq_aligner(imec_rec, digital_events, pulse_din=1):
     # Often, clocks drift linearly. Let's fit tA = slope * tB + intercept
     coef = np.polyfit(pulseB, pulseA, 1)
     slope, intercept = coef
-    print(f"Clock alignment fit: tA ≈ {slope:.9f} * tB + {intercept:.6f}")
+    print(f"Clock alignment fit: tA ~ {slope:.9f} * tB + {intercept:.6f}")
 
     # Create a function to map any DAQ B timestamp into DAQ A time
     map_B_to_A = np.poly1d(coef)
 
     return map_B_to_A
+
+#the NIDQ -> imec clock fit, cached beside binary_signals. Computing it reads the imec SYNC
+#channel, which SpikeGLX interleaves with every probe channel, so it scans the whole AP binary
+#(66-99 GB per session; ~10 min from D:, and its mapped pages fill memory when sessions run in
+#parallel). The fit is two numbers that never change for a session's raw data, so it is kept
+ALIGNMENT_FILE = 'nidq_imec_alignment.json'
+
+
+def _raw_signature(spikeglx_folder, imec_folder):
+    """Sizes of the raw binaries the alignment was computed from (a re-acquired or edited
+    session invalidates the cache)."""
+    sig = {}
+    for folder, pattern in ((spikeglx_folder, '*.nidq.bin'), (imec_folder, '*.ap.bin')):
+        if folder is not None:
+            for f in sorted(Path(folder).glob(pattern)):
+                sig[f.name] = f.stat().st_size
+    return sig
+
+
+def _alignment_file(paths):
+    folder = paths.binary_signals_folder()
+    return folder / ALIGNMENT_FILE if folder is not None else None
+
+
+def load_cached_alignment(paths, spikeglx_folder, imec_folder):
+    """The cached NIDQ -> imec map (np.poly1d) if it matches the raw data, else None."""
+    import json
+    f = _alignment_file(paths)
+    if f is None or not f.exists():
+        return None
+    c = json.loads(f.read_text())
+    if c.get('raw') != _raw_signature(spikeglx_folder, imec_folder):
+        print(f'{f.name} is for other raw files; recomputing the clock alignment')
+        return None
+    print(f"Clock alignment from {f.name} ({c.get('source', '')}): "
+          f"tA ~ {c['slope']:.9f} * tB + {c['intercept']:.6f}")
+    return np.poly1d([c['slope'], c['intercept']])
+
+
+def save_alignment(paths, spikeglx_folder, imec_folder, coef, source):
+    import json
+    f = _alignment_file(paths)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({'slope': float(coef[0]), 'intercept': float(coef[1]),
+                             'source': source,
+                             'raw': _raw_signature(spikeglx_folder, imec_folder)}, indent=2))
+
+
+def seed_alignment_from_saved(base_folder, max_residual_s=1e-6):
+    """Cache the clock alignment of an already parsed session without reading the AP binary.
+
+    Its saved binary_signals holds the raw NIDQ solenoid edges passed through the alignment
+    (solenoid_on), so fitting saved against raw recovers the line exactly; the fit is trusted
+    only if every edge lands within max_residual_s. Returns the coefficients, or None (no
+    saved file, no digital solenoid, or a poor fit) -- the parse then computes it as usual.
+    """
+    base_folder = parse_base_folder(base_folder)
+    paths = fs.SessionPaths(base_folder)
+    dinmap, ainmap, optoidx = parse_channel_maps(paths, None, None, None)
+    if 'solenoid' not in dinmap:
+        return None
+    pynapple_folder, pynapple_file = get_output_folders(paths)
+    if not Path(pynapple_file).exists():
+        return None
+    bs = nap.load_file(str(pynapple_file))
+    saved = {n: np.asarray(bs[k].t) for k, n in zip(bs.keys(), bs.metadata['event'])}.get('solenoid_on')
+    spikeglx_folder = paths.spikeglx_folder()
+    imec_folder = paths.imec_folder(fail_quietly=True)
+    if saved is None or saved.size < 2 or imec_folder is None:
+        return None
+    digital_events = si.read_spikeglx_event(spikeglx_folder)
+    raw = digital_events.get_event_times(digital_events.channel_ids[dinmap['solenoid']])
+    raw_on = np.sort(raw[:len(raw) // 2])
+    if raw_on.size != saved.size:
+        return None
+    coef = np.polyfit(raw_on, np.sort(saved), 1)
+    resid = np.abs(np.polyval(coef, raw_on) - np.sort(saved)).max()
+    if resid > max_residual_s:
+        print(f'saved solenoid_on do not lie on one line with the raw edges (max {resid:.2e} s)')
+        return None
+    save_alignment(paths, spikeglx_folder, imec_folder, coef,
+                   source=f'recovered from the saved binary_signals solenoid_on (max residual {resid:.1e} s)')
+    return coef
+
 
 def binarize_trace(trace, threshold=None):
     if threshold is None:
@@ -108,7 +194,14 @@ def parse_solenoid_analog(analog_events, nidq_t_aligned, idx={'solenoid':4}, plo
     solenoid_ts_index = ['solenoid_on', 'solenoid_off']
     return solenoid_ts_list, solenoid_ts_index
 
-def parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_support, idx={'tone':3}):
+def parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_support, idx={'tone':3},
+                        tonemap=None, method='auto'):
+    """The task's tones from the digital tone line.
+
+    method : 'frequency' (classify by pitch, parse_tones_by_frequency), 'duration' (by length,
+    parse_tones), or 'auto': frequency when the line carries the speaker's square wave (many
+    cycles per tone), duration when it carries only each tone's envelope.
+    """
     time_support = nap.IntervalSet(start=time_support.start, end=time_support.end)
     solenoid_onsets = solenoid_ts_list[0].t
 
@@ -125,10 +218,19 @@ def parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_sup
     tone_onsets = tone_times[:mididx]
     tone_offsets = tone_times[mididx:]
 
+    if method == 'auto':
+        # a square wave has short cycles: most rising edges follow the last within 20 ms
+        rises = np.sort(tone_onsets)
+        method = 'frequency' if rises.size > 10 and np.median(np.diff(rises)) < 0.02 else 'duration'
+    print(f"tone line parsed by {method}")
+    if method == 'frequency':
+        return parse_tones_by_frequency(tone_onsets, tone_offsets, solenoid_onsets, time_support,
+                                        tonemap=tonemap)
     return parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support)
 
 
-def parse_tones_analog(analog_events, solenoid_ts_list, nidq_t_aligned, idx={'tone':5}):
+def parse_tones_analog(analog_events, solenoid_ts_list, nidq_t_aligned,
+                       idx={'tone':5}):
     time_support = nap.IntervalSet(start=nidq_t_aligned[0], end=nidq_t_aligned[-1])
     solenoid_onsets = solenoid_ts_list[0].t
 
@@ -142,44 +244,189 @@ def parse_tones_analog(analog_events, solenoid_ts_list, nidq_t_aligned, idx={'to
 
     return parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support)
 
-def parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support, verbose=False):
+def _near_any(times, targets, tol):
+    """Boolean mask of the times that lie within tol of some target time."""
+    times = np.asarray(times, dtype=float)
+    targets = np.sort(np.asarray(targets, dtype=float))
+    if len(targets) == 0:
+        return np.zeros(len(times), dtype=bool)
+    j = np.searchsorted(targets, times)
+    nearest = np.minimum(np.abs(times - targets[np.clip(j - 1, 0, len(targets) - 1)]),
+                         np.abs(times - targets[np.clip(j, 0, len(targets) - 1)]))
+    return nearest <= tol
+
+#the task's tones, by the frequency the behaviour program plays them at (Hz). The NIDQ tone line
+#carries the speaker's square wave, so each tone is told by its pitch, not its length: an early
+#lick starts the error tone at once, cutting the start cue off part-way, and the line then shows
+#one unbroken pulse whose cue part can be any length (8 ms on DS15_20260702). Measured at 25 kHz
+#on the DS15 and DS48 rigs: 3125, ~5000, 439 and 131 Hz -- the period is quantised to whole
+#samples, so a 3 kHz tone (8.3 samples) reads as 8. A rig playing other tones sets `tonemap` in
+#its nidaq_map.txt (same keys)
+default_tonemap = {'start': 3000.0, 'reward': 5000.0, 'error': 440.0, 'timeout': 130.0}
+#a cycle is given the nearest tone's label when its frequency is within this factor of it (a
+#5 kHz period of 5 samples jitters to 4 or 6, i.e. -17%/+25%)
+TONE_FREQ_TOLERANCE = 1.35
+#the square waves are 50% duty, so a cycle's high time is half its tone's period too; it has
+#to agree within this factor (a 3 kHz half-cycle is 3-4 samples at 25 kHz: up to x1.39). It
+#rejects the cycle spanning a change of pitch, whose period can pass for the new tone's but
+#which starts on the old tone's short high pulse
+TONE_HIGH_TOLERANCE = 1.6
+#labels are smoothed over this many cycles (a running mode), so single cycles mis-measured at
+#the sample resolution do not split a tone
+TONE_SMOOTH_CYCLES = 5
+
+
+def _tone_segments(rises, falls, tonemap, tol=TONE_FREQ_TOLERANCE, smooth=TONE_SMOOTH_CYCLES,
+                   max_gap=0.02):
+    """Constant-pitch tones from the square-wave edges of a digital tone line.
+
+    Every cycle (rising edge to rising edge) is labelled with the nearest tone in log frequency,
+    or none if it is further than `tol` from all of them; labels are smoothed with a running mode
+    over `smooth` cycles; a tone is then a run of one label with no gap over `max_gap` s (the
+    20-ms inter-tone rule the duration parser used). Returns a list of (label, onset, offset).
+    """
+    rises, falls = np.sort(rises), np.sort(falls)
+    if rises.size < 2:
+        return []
+    names = list(tonemap)
+    logf = np.log(np.array([tonemap[n] for n in names], dtype=float))
+    per = np.diff(rises)
+    f = 1.0 / per
+    d = np.abs(np.log(f)[:, None] - logf[None, :])
+    lab = np.where(d.min(axis=1) <= np.log(tol), d.argmin(axis=1), -1)
+    # each cycle's high time: its rising edge to the next falling edge
+    nf = np.searchsorted(falls, rises[:-1], side='left')
+    high = np.where(nf < falls.size, falls[np.clip(nf, 0, falls.size - 1)] - rises[:-1], np.nan)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        f_high = 1.0 / (2.0 * high)
+    ok = np.abs(np.log(f_high) - logf[np.clip(lab, 0, None)]) <= np.log(TONE_HIGH_TOLERANCE)
+    lab = np.where((lab >= 0) & ok, lab, -1)
+    raw = lab.copy()
+    if smooth > 1:
+        half = smooth // 2
+        padded = np.pad(lab, half, mode='edge')
+        win = np.lib.stride_tricks.sliding_window_view(padded, smooth)
+        counts = np.stack([(win == k).sum(axis=1) for k in range(len(names))], axis=1)
+        best = counts.argmax(axis=1)
+        lab = np.where(counts.max(axis=1) > half, best, lab)
+    # a cycle longer than max_gap is the silence between two tones, not a cycle
+    lab = np.where(per > max_gap, -1, lab)
+    segs = []
+    k = 0
+    while k < lab.size:
+        if lab[k] < 0:
+            k += 1
+            continue
+        j = k
+        while j + 1 < lab.size and lab[j + 1] == lab[k]:
+            j += 1
+        nxt_k = j + 1
+        # the smoothing mends mis-measured cycles inside a tone, but must not move its edges:
+        # the cycle spanning a change of pitch (last edge of the cue to first edge of the error
+        # tone) matches neither, and relabelled it would start the tone at the old tone's last
+        # edge (DS2_20260511 at 2291.79 s: 3 ms early, before the lick that triggered it). So a
+        # tone starts and ends on cycles that are its own pitch before smoothing
+        while k <= j and raw[k] != lab[k]:
+            k += 1
+        while j >= k and raw[j] != lab[j]:
+            j -= 1
+        if k > j:
+            k = nxt_k
+            continue
+        # cycles k..j span rises[k] .. rises[j+1]; the tone ends on the last falling edge
+        # before the next rising edge (or the run's last edge)
+        end_rise = rises[j + 1]
+        nxt = np.searchsorted(falls, end_rise, side='left')
+        offset = falls[nxt] if nxt < falls.size and (j + 2 >= rises.size or falls[nxt] < rises[j + 2]) \
+            else end_rise
+        if j - k + 1 >= 3:
+            segs.append((names[lab[k]], float(rises[k]), float(offset)))
+        k = nxt_k
+    return segs
+
+
+def parse_tones_by_frequency(rises, falls, solenoid_onsets, time_support, tonemap=None,
+                             verbose=False, trim_bad_cues=True):
+    """The task's tones from a digital tone line's square wave, classified by pitch.
+
+    Every tone's onset is its own first cycle -- an error tone that cut a start cue off begins
+    where the pitch changes, with no assumption about its length. Reward tones are also checked
+    against the solenoid openings they start with (0.08-0.12 ms after); a mismatch is reported.
+    Same outputs as parse_tones.
+    """
+    tonemap = dict(default_tonemap if tonemap is None else tonemap)
+    segs = _tone_segments(rises, falls, tonemap)
+    by = {n: (np.array([s[1] for s in segs if s[0] == n]), np.array([s[2] for s in segs if s[0] == n]))
+          for n in tonemap}
+    rew_on = by['reward'][0]
+    near = _near_any(rew_on, solenoid_onsets, tol=0.002)
+    print(f"tones by frequency: {', '.join(f'{n} {len(by[n][0])}' for n in tonemap)}; "
+          f"{int(near.sum())}/{len(rew_on)} reward tones start with a solenoid opening "
+          f"({len(solenoid_onsets)} openings)")
+    if near.size and not near.all():
+        print(f"Warning: reward tones without a solenoid opening at {rew_on[~near]}")
+    return _package_tones(by['start'][0], by['start'][1], by['reward'][0], by['reward'][1],
+                          by['timeout'][0], by['timeout'][1], by['error'][0], by['error'][1],
+                          time_support, verbose=verbose, trim_bad_cues=trim_bad_cues)
+
+
+def get_tonemap(paths):
+    """The rig's tone frequencies: `tonemap` from its nidaq_map.txt, else default_tonemap."""
+    config_file = paths.input_map
+    if config_file is not None:
+        tree = ast.parse(Path(config_file).read_text())
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and node.targets[0].id == 'tonemap':
+                return {**default_tonemap, **ast.literal_eval(node.value)}
+    return dict(default_tonemap)
+
+
+def parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support,
+                verbose=False, trim_bad_cues=True):
     tone_onsets.sort()
     tone_offsets.sort()
-    inter_onset_intervals = np.diff(tone_onsets)
-    inter_offset_intervals = np.diff(tone_offsets)
 
-    #append infinity to the end of inter_onset_intervals and inter_offset_intervals to make them the same length as tone_onsets and tone_offsets
-    inter_onset_intervals = np.append(np.inf, inter_onset_intervals)
-    inter_offset_intervals = np.append(inter_offset_intervals, np.inf)
+    inter_tone_intervals = tone_onsets[1:] - tone_offsets[:-1]
+    durations = tone_offsets-tone_onsets
 
+    #append infinity to the end to make them the same length as tone_onsets and tone_offsets
     #keep only tone onsets preceded by an interval of at least 0.001 seconds, and keep only tone offsets followed by an interval of at least 0.01
-    min_isi = 0.009  # minimum inter-stimulus interval in seconds
-    valid_onset_intervals = inter_onset_intervals >= min_isi
-    valid_offset_intervals = inter_offset_intervals >= min_isi
-    valid_tone_onsets = tone_onsets[valid_onset_intervals]
-    valid_tone_offsets = tone_offsets[valid_offset_intervals]
-    #require that the number of valid tone onsets and offsets are the same
-    if len(valid_tone_onsets) != len(valid_tone_offsets):
-        raise ValueError("Number of valid tone onsets does not match number of valid tone offsets")
-    valid_tone_durations = valid_tone_offsets - valid_tone_onsets
-    #make sure tone duration are at least 0.05s. anything less should be discarded
-    valid_dur_idxs = valid_tone_durations > 0.05
-    valid_tone_durations = valid_tone_durations[valid_dur_idxs]
-    valid_tone_onsets = valid_tone_onsets[valid_dur_idxs]
-    valid_tone_offsets = valid_tone_offsets[valid_dur_idxs]
+    min_isi = 0.02  # minimum inter-stimulus interval in seconds
+    valid_itis = inter_tone_intervals >= min_isi
 
+    valid_onsets = tone_onsets[np.append(True, valid_itis)]
+    valid_offsets = tone_offsets[np.append(valid_itis, True)]
+    valid_durations = valid_offsets - valid_onsets
+    #make sure tone duration are at least 0.05s. anything less should be discarded
+    valid_dur_idxs = valid_durations > 0.05
+    valid_durations = valid_durations[valid_dur_idxs]
+    valid_onsets = valid_onsets[valid_dur_idxs]
+    valid_offsets = valid_offsets[valid_dur_idxs]
+
+    #get odd tone indices where the error tone cuts off the cue
+    odd_dur_idxs = (valid_durations > 0.205) & (valid_durations < 1.0)
+    odd_offsets = valid_offsets[odd_dur_idxs]
+    inferred_err_onsets = odd_offsets - 0.20015
+    valid_onsets = np.append(valid_onsets, inferred_err_onsets)
+    valid_onsets.sort()
+    valid_offsets = np.append(valid_offsets, inferred_err_onsets)
+    valid_offsets.sort()
+    valid_durations = valid_offsets - valid_onsets
 
     #get the duration of each tone
-    rounded_tone_durations = np.round(valid_tone_durations, 2)
-    #get indices of tone durations that are not 2, 0.1, or 0.2s
-    odd_tone_idxs = np.where((rounded_tone_durations != 2.0) & (rounded_tone_durations != 0.1) & (rounded_tone_durations != 0.2))[0]
+    rounded_durations = np.round(valid_durations, 2)
+    timeout_idx = rounded_durations > 1.0
+    early_r_reward_idxs = (rounded_durations >= 0.2) & (rounded_durations < 1.0)
+    #get indices of tone onsets that are not timeout or early reward tones
+    cue_idx = ~(timeout_idx | early_r_reward_idxs)
 
-    #round durations to nearest 0.0001
-    #get indices of tone onsets that are found in solenoid onsets
-    reward_tone_onset_idxs = np.where(np.isin(np.round(valid_tone_onsets,1), np.round(solenoid_onsets,1)))[0]
+    #a reward tone is the tone that starts with a solenoid opening (0.08-0.12 ms after it). match on
+    #distance, not on rounded values: rounding to 10 ms splits any pair straddling a rounding
+    #boundary, which mislabelled a DS48_20260923 reward tone as an error tone
+    reward_tone_onset_idx = _near_any(valid_onsets, solenoid_onsets, tol=0.002)
 
-    reward_tone_onsets = valid_tone_onsets[reward_tone_onset_idxs]
-    reward_tone_offsets = valid_tone_offsets[reward_tone_onset_idxs]
+    reward_tone_onsets = valid_onsets[reward_tone_onset_idx]
+    reward_tone_offsets = valid_offsets[reward_tone_onset_idx]
 
 
     #if length of reward tone onsets is not equal to length of solenoid onsets, print a warning
@@ -191,36 +438,34 @@ def parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support, verbos
             print('solenoid_onsets', solenoid_onsets)
             print('number of solenoid onsets', len(solenoid_onsets))
 
-    long_tone_bool = np.round(valid_tone_durations) == 2
-    long_tone_idxs = np.where(long_tone_bool)[0]
-    timeout_tone_onsets = valid_tone_onsets[long_tone_idxs]
-    timeout_tone_offsets = valid_tone_offsets[long_tone_idxs]
+    timeout_tone_onsets = valid_onsets[timeout_idx]
+    timeout_tone_offsets = valid_offsets[timeout_idx]
 
     #cue tones are tones where tone duration is 0.1 seconds
-    cue_tone_bool = np.round(valid_tone_durations,1) == 0.1
-    cue_tone_idxs = np.where(cue_tone_bool)[0]
-    cue_tone_onsets = valid_tone_onsets[cue_tone_idxs]
-    cue_tone_offsets = valid_tone_offsets[cue_tone_idxs]
+    cue_tone_onsets = valid_onsets[cue_idx]
+    cue_tone_offsets = valid_offsets[cue_idx]
 
     #error tones are the tones that are not reward, timeout, or cue tones
-    all_special_tone_idxs = np.unique(np.concatenate((reward_tone_onset_idxs, long_tone_idxs, cue_tone_idxs, odd_tone_idxs)))
-    error_tone_idxs = np.setdiff1d(np.arange(len(valid_tone_onsets)), all_special_tone_idxs)
-    error_tone_onsets = valid_tone_onsets[error_tone_idxs]
-    error_tone_offsets = valid_tone_offsets[error_tone_idxs]
+    #
+    non_err_tone_idx = reward_tone_onset_idx + timeout_idx + cue_idx
+    error_tone_idx = non_err_tone_idx == 0
 
-    #for all odd tone idxs, add the start to cue onset and the end - 200 to error onset
-    for idx in odd_tone_idxs:
-        ontime = valid_tone_onsets[idx]
-        offtime = valid_tone_offsets[idx]
-        cue_tone_onsets = np.append(cue_tone_onsets, ontime)
-        cue_tone_offsets = np.append(cue_tone_offsets, offtime - 0.2)
-        error_tone_onsets = np.append(error_tone_onsets, offtime - 0.2)
-        error_tone_offsets = np.append(error_tone_offsets, offtime)
-    error_tone_onsets.sort()
-    error_tone_offsets.sort()
-    cue_tone_onsets.sort()
-    cue_tone_offsets.sort()
+    error_tone_onsets = valid_onsets[error_tone_idx]
+    error_tone_offsets = valid_offsets[error_tone_idx]
 
+    return _package_tones(cue_tone_onsets, cue_tone_offsets, reward_tone_onsets, reward_tone_offsets,
+                          timeout_tone_onsets, timeout_tone_offsets, error_tone_onsets,
+                          error_tone_offsets, time_support, verbose=verbose,
+                          trim_bad_cues=trim_bad_cues)
+
+
+def _package_tones(cue_tone_onsets, cue_tone_offsets, reward_tone_onsets, reward_tone_offsets,
+                   timeout_tone_onsets, timeout_tone_offsets, error_tone_onsets, error_tone_offsets,
+                   time_support, verbose=False, trim_bad_cues=True):
+    """Check that cues and outcomes interleave, and package the tones as Ts.
+
+    Shared by the duration (parse_tones) and the frequency (parse_tones_by_frequency) parsers.
+    """
     #check that outcomes don't happen between cues
     for i, cue in enumerate(cue_tone_onsets):
         #get the next cue
@@ -243,15 +488,24 @@ def parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support, verbos
             f"{n_outcomes - n_cues} outcome(s) have no preceding cue."
         )
     if n_cues > n_outcomes + 1:
-        print(f"Warning: {n_cues - n_outcomes} unmatched cue(s) at end of session (expected at most 1).")
+        print(f"Warning: {n_cues - n_outcomes} unmatched cue(s)")
 
+
+    bad_cues_idxs = []
     for i in range(n_outcomes):
         if cue_tone_onsets[i] >= outcomes[i]:
             raise ValueError(
                 f"Cue {i} (t={cue_tone_onsets[i]:.4f}) does not precede its outcome (t={outcomes[i]:.4f})."
             )
         if i < n_outcomes - 1 and outcomes[i] >= cue_tone_onsets[i + 1]:
-            raise ValueError(
+            if trim_bad_cues:
+                j=i
+                while i < n_outcomes - 1 and outcomes[i] >= cue_tone_onsets[i + 1]:
+                    bad_cues_idxs.append(j)
+                    cue_tone_onsets = np.delete(cue_tone_onsets, i, 0)
+                    j = j+1
+
+            else: raise ValueError(
                 f"Outcome {i} (t={outcomes[i]:.4f}) does not precede cue {i+1} (t={cue_tone_onsets[i+1]:.4f}): "
                 f"sequences are not properly interleaved."
             )
@@ -298,22 +552,28 @@ def get_digital_ts(digital_events, time_support, map2imectime=None, din=None, ev
     #lick_ontimes, lickofftimes = get_licks(digital_events, map2imectime)
     digchids = digital_events.channel_ids
     times = digital_events.get_event_times(digchids[din])
-    if map2imectime is not None:
-        times = map2imectime(times)
-    n_times = len(times)
-    offtimes = times[n_times//2:]
-    ontimes = times[:n_times//2]
+    #check that times is not empty
+    if len(times) == 0:
+        print('warning, no events found for digital channel', din)
+        ontimes = []
+        offtimes = []
+    else:
+        if map2imectime is not None:
+            times = map2imectime(times)
+        n_times = len(times)
+        offtimes = times[n_times//2:]
+        ontimes = times[:n_times//2]
 
-    #check that the first ontime is less than the first offtime
-    if ontimes[0] > offtimes[0]:
-        #remove the first index from offtimes
-        offtimes = offtimes[1:]
-    #check that the last ontime is less than the last offtime
-    if ontimes[-1] > offtimes[-1]:
-        ontimes = ontimes[:-1]
+        #check that the first ontime is less than the first offtime
+        if ontimes[0] > offtimes[0]:
+            #remove the first index from offtimes
+            offtimes = offtimes[1:]
+        #check that the last ontime is less than the last offtime
+        if ontimes[-1] > offtimes[-1]:
+            ontimes = ontimes[:-1]
 
-    if (ontimes[0] > offtimes[0] or ontimes[-1] > offtimes[-1]):
-        raise ValueError("Onset times and offset times are not properly ordered. Check the digital event times and mapping.")
+        if (ontimes[0] > offtimes[0] or ontimes[-1] > offtimes[-1]):
+            raise ValueError("Onset times and offset times are not properly ordered. Check the digital event times and mapping.")
 
     on_ts = nap.Ts(t=ontimes, time_support=time_support)
     off_ts = nap.Ts(t=offtimes, time_support=time_support)
@@ -533,7 +793,15 @@ def get_opto_ts(analog_events, nidq_t_aligned, idx=None, pwrs=None, plot=False, 
     return ts_list, ts_idx
 
 #for each start tone timestamp, find the closest outcome tone timestamp that follows
-def parse_trials(start_tone_ts, outcome_tone_ts, lick_ts, require_first_licks=True):
+def parse_trials(start_tone_ts, outcome_tone_ts, lick_ts, require_first_licks=True, anchors=None):
+    """Trials from start cues and one kind of outcome tone, with each trial's first lick.
+
+    The first lick is the lick that triggered the outcome: the last lick between the trial's
+    cue and its anchor. anchors : per outcome tone, the event the lick triggered (the solenoid
+    opening of a rewarded trial, which precedes its reward tone by ~0.1 ms); the outcome tone
+    itself by default.
+    """
+    anchors = (np.asarray(outcome_tone_ts.t) if anchors is None else np.asarray(anchors, dtype=float))
     #for each timestamp in outcome_tone_ts, find the closest timestamp in start_tone_ts that is less than it
     time_support = lick_ts.time_support
     trial_starts = []
@@ -541,7 +809,7 @@ def parse_trials(start_tone_ts, outcome_tone_ts, lick_ts, require_first_licks=Tr
     first_licks = []
     start_cues = []
     outcome_tones = []
-    for t in outcome_tone_ts.t:
+    for t, anchor in zip(outcome_tone_ts.t, anchors):
         #get timestamps of start_tone_ts.t that are less than outcome_tone.t[t]
         possible_starts = start_tone_ts.t[start_tone_ts.t < t]
         #ensure possible_starts are sorted
@@ -554,7 +822,7 @@ def parse_trials(start_tone_ts, outcome_tone_ts, lick_ts, require_first_licks=Tr
             outcome_tones.append(t)
 
             assert trial_start < t, "Trial start {} is not less than trial end {}".format(trial_start, t)
-            trial_licks = lick_ts.t[(lick_ts.t >= trial_start) & (lick_ts.t <= t)]
+            trial_licks = lick_ts.t[(lick_ts.t >= trial_start) & (lick_ts.t <= anchor)]
             if len(trial_licks) > 0:
                 first_lick = trial_licks[-1]
             else:
@@ -758,7 +1026,6 @@ def load_pynapple_file(pynapple_file):
 
 
 def _split_event_label(event_name):
-    import re
     if not isinstance(event_name, str):
         return event_name, None
 
@@ -894,7 +1161,292 @@ def _unique_output_path(path):
         counter += 1
 
 
-def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, overwrite=False, plot=False, test_mode=False, plot_save_folder=None):
+def pool_task_stim(tsg, opsin, min_dur=0.5):
+    """Task-related opto pulses for one opsin, as (on_times, off_times, intensities).
+
+    Pulses shorter than min_dur are the ~100ms calibration flashes fired before and after the
+    session rather than stimulation delivered on a trial, so they are dropped. Intensity comes out
+    of the event label (chrimson_on_40 -> 40) and is nan on the digital opto path, whose labels
+    carry no power level. Sessions with no opto channel give three empty arrays.
+    """
+    meta = tsg.metadata
+
+    def _pool(edge):
+        prefix = f'{opsin}_{edge}'
+        times, levels = [], []
+        for key, row in meta.iterrows():
+            name = row.get('event')
+            #startswith rather than == so both label styles are caught: the analog path names each
+            #power separately (chrimson_on_40), the digital path has the bare chrimson_on. It also
+            #keeps the continuous chrimson_trace out, which has no edges to pool
+            if not isinstance(name, str) or not name.startswith(prefix):
+                continue
+            m = re.match(rf'^{re.escape(prefix)}_(\d+)$', name)
+            t = np.asarray(tsg[key].t)
+            times.append(t)
+            levels.append(np.full(len(t), float(m.group(1)) if m else np.nan))
+        if not times:
+            return np.array([]), np.array([])
+        t = np.concatenate(times)
+        lv = np.concatenate(levels)
+        order = np.argsort(t)
+        return t[order], lv[order]
+
+    on_all, on_levels = _pool('on')
+    off_all, _ = _pool('off')
+    if len(on_all) == 0 or len(off_all) == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    task_on, task_off, task_levels = [], [], []
+    for t_on, level in zip(on_all, on_levels):
+        following = off_all[off_all > t_on]
+        if len(following) > 0 and (following[0] - t_on) > min_dur:
+            task_on.append(t_on)
+            task_off.append(following[0])
+            task_levels.append(level)
+    return np.array(task_on), np.array(task_off), np.array(task_levels)
+
+
+def plot_trial_raster(tsg, ch_on=None, ch_off=None, c2_on=None, c2_off=None,
+                      ch_intensities=None, c2_intensities=None,
+                      save_path=None, t_start=-1.0, t_end=8.0):
+    """Trial raster: one row per start cue, aligned at t=0.
+
+    - Black hash: licks
+    - Green dot: reward tone onset
+    - Red dot: error tone onset
+    - Blue band: chr2 opto stim (alpha scaled by intensity if provided)
+    - Orange band: chrimson opto stim (alpha scaled by intensity if provided)
+
+    This is the parse-time QC view of the events that were just extracted -- a session whose tones,
+    licks and solenoid were mapped correctly shows licks bunching after the cue and outcome dots
+    landing at trial ends. analysis/pres_plot_utils.plot_trial_raster is the figure-quality sibling
+    of this, sized for a presentation panel and driven off a saved binary_signals file.
+    """
+    import matplotlib.patches as mpatches
+
+    meta = tsg.metadata
+
+    def _ts(event_name):
+        idx = meta[meta['event'] == event_name].index
+        return np.asarray(tsg[idx[0]].t) if len(idx) > 0 else np.array([])
+
+    cue_ts = _ts('start_cues')
+    rew_ts = _ts('reward_tones')
+    err_ts = _ts('early_tones')
+    #the raw lick line only. every other lick-named event (bout edges, per-outcome first licks) is
+    #a subset of it, so pooling them would just draw the same licks two and three times over
+    lick_ts = _ts('lick_on')
+
+    n_trials = len(cue_ts)
+    if n_trials == 0:
+        print("Warning: no start cues found, skipping trial raster.")
+        return None
+
+    ch_on  = np.asarray(ch_on  if ch_on  is not None else [])
+    ch_off = np.asarray(ch_off if ch_off is not None else [])
+    c2_on  = np.asarray(c2_on  if c2_on  is not None else [])
+    c2_off = np.asarray(c2_off if c2_off is not None else [])
+
+    def _alpha_arr(n_pulses, intensities, default=0.3):
+        #darker band = brighter pulse. an all-nan intensity array is the digital opto path, which
+        #never recorded a power level, so every band gets the flat default
+        if intensities is None or len(intensities) == 0:
+            return np.full(n_pulses, default)
+        arr = np.asarray(intensities, dtype=float)
+        if not np.any(np.isfinite(arr)):
+            return np.full(n_pulses, default)
+        lo, hi = np.nanmin(arr), np.nanmax(arr)
+        norm = (arr - lo) / (hi - lo) if hi > lo else np.ones_like(arr)
+        return np.where(np.isfinite(norm), 0.12 + 0.38 * norm, default)
+
+    ch_alphas = _alpha_arr(len(ch_on), ch_intensities)
+    c2_alphas = _alpha_arr(len(c2_on), c2_intensities)
+
+    fig_h = max(4, min(n_trials * 0.15 + 1, 40))
+    fig, ax = plt.subplots(figsize=(7, fig_h))
+
+    #band colour is the wavelength each opsin is driven at, which is what the legend promises:
+    #chrimson orange, chr2 blue. the pres_plot_utils original has these two the other way round
+    stim_layers = [
+        (ch_on, ch_off, (1.0, 0.5, 0.0), ch_alphas),
+        (c2_on, c2_off, (0.1, 0.4, 1.0), c2_alphas),
+    ]
+
+    for ti, ct in enumerate(cue_ts):
+        ws, we = ct + t_start, ct + t_end
+
+        for son, soff, rgb, alphas in stim_layers:
+            #pi, not the si of the pres_plot_utils original: si is spikeinterface in this module
+            for pi in range(min(len(son), len(soff))):
+                ton, toff = son[pi], soff[pi]
+                if toff < ws or ton > we:
+                    continue
+                x0 = max(ton, ws) - ct
+                x1 = min(toff, we) - ct
+                ax.add_patch(mpatches.Rectangle(
+                    (x0, ti - 0.5), x1 - x0, 1.0,
+                    facecolor=rgb, alpha=float(alphas[pi]) if pi < len(alphas) else 0.3,
+                    linewidth=0, zorder=1,
+                ))
+
+        licks_in = lick_ts[(lick_ts >= ws) & (lick_ts < we)]
+        if len(licks_in):
+            ax.plot(licks_in - ct, np.full(len(licks_in), ti),
+                    '|', color='k', markersize=6, markeredgewidth=1.0, zorder=2)
+
+        rews_in = rew_ts[(rew_ts >= ws) & (rew_ts < we)]
+        if len(rews_in):
+            ax.plot(rews_in - ct, np.full(len(rews_in), ti),
+                    'o', color='limegreen', markersize=4, zorder=3)
+
+        errs_in = err_ts[(err_ts >= ws) & (err_ts < we)]
+        if len(errs_in):
+            ax.plot(errs_in - ct, np.full(len(errs_in), ti),
+                    'o', color='red', markersize=4, zorder=3)
+
+    ax.set_xlim(t_start, t_end)
+    ax.set_ylim(n_trials - 0.5, -0.5)
+    ax.axvline(0, color='k', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax.axvline(3.33, color='green', linestyle='--', linewidth=0.8, alpha=0.7)
+    ax.set_xlabel('t(s) from cue')
+    ax.set_ylabel('Trial')
+    ax.set_title(f'Trial raster (n={n_trials} trials)')
+
+    legend_handles = [
+        plt.Line2D([0], [0], marker='|', color='k', linestyle='none',
+                   markersize=8, markeredgewidth=1.5, label='Lick'),
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='limegreen',
+                   markersize=6, label='Reward'),
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
+                   markersize=6, label='Early'),
+        mpatches.Patch(facecolor=(0.1, 0.4, 1.0), alpha=0.5, label='Blue/ChR2 stim'),
+        mpatches.Patch(facecolor=(1.0, 0.5, 0.0), alpha=0.5, label='Orange/ChrimsonR stim'),
+    ]
+    ax.legend(handles=legend_handles, ncol=1, framealpha=0.9,
+              loc='upper left', bbox_to_anchor=(1.01, 1), borderaxespad=0)
+
+    if save_path is not None:
+        #overwritten rather than uniquified: this is regenerated on every get_binary_signals call,
+        #cached loads included, so numbered copies would pile up over repeat runs of one session
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved trial raster to {save_path}")
+        plt.close(fig)
+
+    return fig
+
+
+def _warn_if_licks_recoverable(bs, paths, lick_source):
+    """A cached parse with no licks, for a session that has an event table to recover them from."""
+    if lick_source == 'nidq' or paths.event_table is None:
+        return
+    lick_rows = bs.metadata.index[bs.metadata['event'] == 'lick_on']
+    if len(lick_rows) and len(bs[lick_rows[0]].t) == 0:
+        print(f"Warning: the cached binary signals have no licks, but {paths.event_table.name} "
+              f"has them. Back up {paths.binary_signals_file().name} and re-parse with "
+              f"overwrite=True to recover them.")
+
+
+def save_trial_raster(tsg, paths):
+    """Write the QC trial raster into the session's analysis-side binary_signals folder.
+
+    Called on every get_binary_signals return, freshly parsed or loaded from cache, and never
+    allowed to take the run down with it: by this point the npz is already on disk and the parse
+    has succeeded, so a matplotlib failure or an event this session happens not to have is worth a
+    warning, not the loss of a good parse.
+    """
+    try:
+        ch_on, ch_off, ch_int = pool_task_stim(tsg, 'chrimson')
+        c2_on, c2_off, c2_int = pool_task_stim(tsg, 'chr2')
+        plot_trial_raster(tsg,
+                          ch_on=ch_on, ch_off=ch_off, c2_on=c2_on, c2_off=c2_off,
+                          ch_intensities=ch_int, c2_intensities=c2_int,
+                          save_path=paths.binary_signals_folder() / 'trial_raster.png')
+    except Exception as e:
+        print(f"Warning: could not make trial raster ({type(e).__name__}: {e})")
+
+
+LICK_SOURCES = ('auto', 'nidq', 'event_table')
+#beside binary_signals.npz: the record of where an event-table session's licks came from
+ETL_DIAGNOSTICS_STEM = 'lick_event_table_alignment'
+
+
+def get_lick_ts(digital_events, time_support, map2imectime, dinmap, paths, recorded_events,
+                lick_source='auto'):
+    """Lick onsets/offsets as [lick_on Ts, lick_off Ts], ['lick_on', 'lick_off'].
+
+    lick_source picks where they come from:
+      'nidq'        -- the NIDQ lick line (dinmap['licks']) only, even when it is empty.
+      'event_table' -- the behaviour computer's <session>_eventTable.csv, placed on the
+                       binary_signals clock by fitting the task events it shares with the NIDQ
+                       (recorded_events, from this same parse; see event_table_licks.py).
+      'auto'        -- the NIDQ, unless its lick line is absent or empty and the session has an
+                       event table, i.e. the BNC copy of the lick line was not recorded.
+    The event table logs lick onsets only, so lick_off is left empty there -- the same as an empty
+    NIDQ channel gives, which keeps the event layout of every session the same. Nothing derived
+    from licks uses the offsets.
+    """
+    if lick_source not in LICK_SOURCES:
+        raise ValueError(f"lick_source must be one of {LICK_SOURCES}, not {lick_source!r}")
+    names = ['lick_on', 'lick_off']
+    diag_folder = paths.binary_signals_folder()
+
+    nidq_list = None
+    if 'licks' in dinmap.keys() and lick_source != 'event_table':
+        nidq_list, _ = get_digital_ts(digital_events, time_support, map2imectime, dinmap['licks'])
+    elif lick_source == 'nidq':
+        raise ValueError("Lick channel not found in dinmap.")
+
+    nidq_empty = nidq_list is None or len(nidq_list[0]) == 0
+    use_table = lick_source == 'event_table' or (lick_source == 'auto' and nidq_empty)
+    table_file = paths.event_table if use_table else None
+    if table_file is None:
+        if lick_source == 'event_table':
+            raise FileNotFoundError(f"lick_source='event_table' but {paths.recording_folder} has no "
+                                    f"*{fs.EVENT_TABLE_SUFFIX}")
+        if nidq_list is None:
+            raise ValueError("Lick channel not found in dinmap, and no event table to take licks from.")
+        if nidq_empty:
+            recover = ("lick_source='auto' or 'event_table' would take them from "
+                       f"{paths.event_table.name}" if paths.event_table is not None
+                       else "there is no event table to recover them from")
+            print(f"Warning: the NIDQ lick channel is empty and {recover}; lick-derived events "
+                  f"(first licks, cues, bouts) will be empty.")
+        #licks from the NIDQ: drop any alignment record a previous event-table parse left, so the
+        #binary_signals folder never claims a source its npz no longer has
+        for stale in diag_folder.glob(f"{ETL_DIAGNOSTICS_STEM}.*"):
+            stale.unlink()
+        return nidq_list, names
+
+    if lick_source == 'auto':
+        print(f"NIDQ lick channel {'is empty' if nidq_list is not None else 'is not mapped'}; "
+              f"taking licks from the event table instead.")
+    licks, diagnostics = etl.event_table_licks(table_file, recorded_events, time_support)
+    print(etl.summarize(diagnostics))
+    try:
+        json_file, png_file = etl.save_diagnostics(diagnostics, diag_folder, stem=ETL_DIAGNOSTICS_STEM)
+        print(f"Event-table alignment diagnostics saved to {json_file} and {png_file.name}")
+    except Exception as e:
+        print(f"Warning: could not save event-table alignment diagnostics ({type(e).__name__}: {e})")
+    return [nap.Ts(t=licks, time_support=time_support),
+            nap.Ts(t=np.array([]), time_support=time_support)], names
+
+
+
+def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, overwrite=False, plot=False, test_mode=False, plot_save_folder=None,
+                       lick_source='auto', tone_method='auto', save=True):
+    """Parse a session's NIDQ into the binary_signals TsGroup, or load the cached one.
+
+    lick_source: 'auto' | 'nidq' | 'event_table' -- where the licks come from; see get_lick_ts.
+    The default takes them from the session's event table only when the NIDQ lick line is empty.
+    It applies only when parsing (overwrite=True, or no cached npz): a cached load is returned as
+    saved, whatever its lick source.
+    tone_method: 'auto' | 'frequency' | 'duration' -- how the digital tone line is classified;
+    see parse_tones_digital (tone frequencies from the rig's `tonemap`, see get_tonemap).
+    save: False parses into memory only -- nothing is written (no npz, mirror, csv or raster).
+    """
     #section 1: folder handling. one SessionPaths resolves every location this run needs -- raw
     #data and the channel map out of recording_files, products into analysis_files -- so nothing
     #below has to re-derive a path from base_folder
@@ -910,8 +1462,13 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
     if not overwrite:
         bs = load_pynapple_file(pynapple_file)
         if bs is not None:
+            if lick_source != 'auto':
+                print(f"Note: lick_source={lick_source!r} is ignored for a cached load; pass "
+                      f"overwrite=True to re-parse with it.")
+            _warn_if_licks_recoverable(bs, paths, lick_source)
             paths.mirror_binary_signals()
             export_event_table(bs, event_csv_file)
+            save_trial_raster(bs, paths)
             return bs
 
     #section 2: channel mapping
@@ -919,10 +1476,12 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
 
     #section 3: read in spikeglx data
     if imec_folder is not None:
-        imec_rec = si.read_spikeglx(imec_folder, stream_name='imec0.ap', load_sync_channel=True)
+        #imec_rec = si.read_spikeglx(imec_folder, stream_name='imec0.ap')#, load_sync_channel=True)
+        sync_rec = si.read_spikeglx(imec_folder, stream_name='imec0.ap-SYNC')
     else:
-        imec_rec = None
+        sync_rec = None
     nidq_rec = si.read_spikeglx(spikeglx_folder, stream_id='nidq')
+    stream_names = si.get_neo_streams('spikeglx', spikeglx_folder)
 
     chids = nidq_rec.channel_ids #get all channel ids--channels are indexed using alphanumeric string identifier
     anachids = [chid for chid in chids if 'D' not in str(chid)] #get analog channel ids (ones without 'D' in them)
@@ -934,8 +1493,13 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
     pulse_din = get_timing_pulse_din(dinmap)
     nidq_t = nidq_rec.get_times()
     nidq_t = nidq_t - nidq_t[0]  # zeroing time
-    if imec_rec is not None:
-        map2imectime = get_nidq_aligner(imec_rec, digital_events, pulse_din)
+    if sync_rec is not None:
+        map2imectime = load_cached_alignment(paths, spikeglx_folder, imec_folder)
+        if map2imectime is None:
+            map2imectime = get_nidq_aligner(sync_rec, digital_events, pulse_din)
+            if save:
+                save_alignment(paths, spikeglx_folder, imec_folder, map2imectime.coeffs,
+                               source='fitted on the imec SYNC and NIDQ timing pulses')
         nidq_t_aligned = map2imectime(nidq_t)
     else:
         nidq_t_aligned = nidq_t
@@ -956,7 +1520,8 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
     ts_idx += solenoid_ts_idx
 
     if 'tone' in dinmap.keys():
-        tones_ts_list, tones_ts_idx = parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_support, idx=dinmap)
+        tones_ts_list, tones_ts_idx = parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_support, idx=dinmap,
+                                                          tonemap=get_tonemap(paths), method=tone_method)
     elif 'tone' in ainmap.keys():
         tones_ts_list, tones_ts_idx = parse_tones_analog(analog_events, solenoid_ts_list, nidq_t_aligned, idx=ainmap)
     else:
@@ -964,11 +1529,10 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
     ts_list += tones_ts_list
     ts_idx += tones_ts_idx
 
-    if 'licks' in dinmap.keys():
-        lick_din = dinmap['licks']
-        lick_ts_list, lick_ts_idx = get_digital_ts(digital_events, time_support, map2imectime, lick_din)
-    else:
-        raise ValueError("Lick channel not found in dinmap.")
+    #the task events recorded so far (solenoid, tones) are what an event table is aligned on
+    recorded_events = {name: ts.t for ts, name in zip(ts_list, ts_idx)}
+    lick_ts_list, lick_ts_idx = get_lick_ts(digital_events, time_support, map2imectime, dinmap, paths,
+                                            recorded_events, lick_source=lick_source)
 
     ts_list += lick_ts_list
     ts_idx += lick_ts_idx
@@ -1018,7 +1582,14 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
     ITI_starts = nap.Ts(all_outcome_tone_ts.t[:-1] + 3.7)
     ITI_ends = nap.Ts(start_tone_ts.t[1:] - 1.5)
 
-    reward_trials_starts, reward_trials_ends, rewarded_cues_ts, reward_tones_ts, rewarded_first_licks_ts = parse_trials(start_tone_ts, reward_tone_ts, lick_ts)
+    #a rewarded trial's first lick is the one that opened the solenoid, which the reward tone
+    #follows by ~0.1 ms: the lick search ends at the opening (the tone where none is matched)
+    sol_on = np.sort(tsg[metadata[metadata['event'] == 'solenoid_on'].index[0]].t)
+    j = np.searchsorted(sol_on, reward_tone_ts.t + 1e-9, side='right') - 1
+    prev_sol = np.where(j >= 0, sol_on[np.clip(j, 0, None)], -np.inf) if len(sol_on) else np.full(len(reward_tone_ts.t), -np.inf)
+    reward_anchors = np.where(reward_tone_ts.t - prev_sol <= 0.002, prev_sol, reward_tone_ts.t)
+    reward_trials_starts, reward_trials_ends, rewarded_cues_ts, reward_tones_ts, rewarded_first_licks_ts = parse_trials(start_tone_ts, reward_tone_ts, lick_ts,
+                                                                                                                      anchors=reward_anchors)
     error_trials_starts, error_trials_ends, early_cues_ts, early_tones_ts, early_first_licks_ts = parse_trials(start_tone_ts, error_tone_ts, lick_ts)
     timeout_trials_starts, timeout_trials_ends, timeout_cues_ts, timeout_tones_ts, _  = parse_trials(start_tone_ts, timeout_tone_ts, lick_ts, require_first_licks=False)
 
@@ -1068,9 +1639,12 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
 
     # mege first_licks_ts into tsg
     tsg = tsg.merge(first_licks_ts, reset_index=True)
+    if not save:
+        return tsg
     tsg.save(str(pynapple_file))
     paths.mirror_binary_signals()
     export_event_table(tsg, event_csv_file)
+    save_trial_raster(tsg, paths)
 
     return tsg
 
@@ -1084,5 +1658,7 @@ def test():
     plot=True
     plot_save_folder = None
     #base_folder = Path(r'C:\Users\assad\Documents\recording_files\DS13\DS13_20250824')
-    base_folder = Path(r"C:\Users\assad\Desktop\experiment_data\recording_files\DS48\DS48_20260729")
+    #base_folder = Path(r"C:\Users\assad\Desktop\experiment_data\recording_files\DS48\DS48_20260729")
+    #base_folder = Path(r"C:\Users\assad\Desktop\experiment_data\recording_files\DS15\DS15_20260703")
+    base_folder = Path(r"C:\Users\assad\Desktop\experiment_data\recording_files\DS45\DS45_20260814")
     tsg = get_binary_signals(base_folder,dinmap,ainmap,optoidx,overwrite,plot,test_mode)

@@ -24,7 +24,19 @@
       "Bash(mkdir -p __TRACKED_VAR__/maptest)",
       "Read(//c/Users/assad/Desktop/experiment_data/recording_files/DS48/DS48_20260729/**)",
       "Read(//c/Users/assad/Desktop/experiment_data/recording_files/DS48/**)",
-      "Read(//c/Users/assad/Documents/recording_files/**)"
+      "Read(//c/Users/assad/Documents/recording_files/**)",
+      "Read(//c/Users/assad/Desktop/experiment_data/sorting_files/**)",
+      "Read(//c/Users/assad/Desktop/experiment_data/recording_files/**)",
+      "PowerShell($sp = \"C:\\\\Users\\\\assad\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-assad-Documents-codevault-spikeinterface-pipeline\\\\dfae095e-4e7c-4b37-8ec5-bb339dfcab93\\\\scratchpad\"; python \"$sp\\\\test_save_raster.py\" \"$sp\")",
+      "PowerShell(python -m py_compile utils/file_structure.py scripts/si_pipeline.py scripts/ben_pipeline.py scripts/resort_pipeline.py tests/sorting_test.py tests/postprocessing_test.py; if \\($?\\) { \"compile OK\" })",
+      "PowerShell(python \"C:\\\\Users\\\\assad\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-assad-Documents-codevault-spikeinterface-pipeline\\\\1eb3d71b-b689-4ff7-8e5d-435857c12fc4\\\\scratchpad\\\\test_validation_plots.py\")",
+      "PowerShell(python -m py_compile \"C:\\\\Users\\\\assad\\\\Documents\\\\codevault\\\\spikeinterface_pipeline\\\\analysis\\\\compendium_plots.py\" \"C:\\\\Users\\\\assad\\\\Documents\\\\codevault\\\\spikeinterface_pipeline\\\\analysis\\\\pres_plot_utils.py\"; if \\($?\\) { \"compile OK\" })",
+      "PowerShell(python -m py_compile \"C:\\\\Users\\\\assad\\\\Documents\\\\codevault\\\\spikeinterface_pipeline\\\\preprocessing\\\\preprocess_qc.py\" \"C:\\\\Users\\\\assad\\\\Documents\\\\codevault\\\\spikeinterface_pipeline\\\\scripts\\\\si_pipeline.py\"; if \\($?\\) { \"compile OK\" })",
+      "PowerShell(python -c \"import ast,sys; ast.parse\\(open\\(r'C:\\\\Users\\\\assad\\\\Documents\\\\codevault\\\\spikeinterface_pipeline\\\\preprocessing\\\\preprocess_qc.py',encoding='utf-8'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "PowerShell(python \"C:\\\\Users\\\\assad\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-assad-Documents-codevault-spikeinterface-pipeline\\\\e19bb039-ddc2-4f78-9659-abe183c6e3eb\\\\scratchpad\\\\t_art.py\")",
+      "PowerShell(python -c \"import spikeinterface; print\\(spikeinterface.__version__\\)\")",
+      "PowerShell(python \"C:\\\\Users\\\\assad\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-assad-Documents-codevault-spikeinterface-pipeline\\\\e19bb039-ddc2-4f78-9659-abe183c6e3eb\\\\scratchpad\\\\t_ev.py\")",
+      "PowerShell(python \"C:\\\\Users\\\\assad\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-assad-Documents-codevault-spikeinterface-pipeline\\\\e19bb039-ddc2-4f78-9659-abe183c6e3eb\\\\scratchpad\\\\t_int.py\")"
     ]
   }
 }

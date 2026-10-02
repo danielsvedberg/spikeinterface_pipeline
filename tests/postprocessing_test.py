@@ -26,8 +26,8 @@ folders = fs.SessionPaths(base_folder).create_output_folders()
 #get the folders inside the recording folder that end with '_g0'
 spikeglx_folder = list(folders.recording_folder.glob('*_g0'))[0]
 
-rec = sc.load(folders.sorting_path('preprocess'))
-sorting = si.read_kilosort(folder_path=folders.sorting_path('kilosort4_output', 'sorter_output'))
+rec = sc.load(folders.preprocess_folder)
+sorting = si.read_kilosort(folder_path=folders.sorting_path(fs.KS_FOLDER, 'sorter_output'))
 clean_sorting = remove_duplicated_spikes(sorting, censored_period_ms=0.1)
 job_kwargs = dict(n_jobs=22, chunk_duration='1s', progress_bar=True)
 

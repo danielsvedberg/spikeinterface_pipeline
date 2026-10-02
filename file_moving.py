@@ -2,12 +2,14 @@
 file_moving.py will take a (recording) rec_folder, which contains raw recording files, preprocessed signals files, spike-sorting
 files, and post-hoc analysis that all correspond to a single recording session--spread across various folders, within
 the rec_folder--and moves them to separate folders in 3 categories: 1) (raw) recording files, which will contain
-just the raw recorded data, 2) sorting_files, which will contain files related to the spike sorting pipeline, including
-pre-processed data, extracted binary signals, the kilosort spike sorting output, and files related to curation, and 3)
+the recorded data and the preprocess folder derived from it, 2) sorting_files, which will contain files related to the
+spike sorting pipeline, including extracted binary signals, the kilosort spike sorting output, and files related to
+curation, and 3)
 analysis files, which will contain the pynapple files that are the product of the final curation, posthoc analysis plots,
 and a copy of the extracted binary signals. Raw recording files include any file under ANID_g# folders as well as
-the ANID_YYYYMMDD_Timestamp.csv, ...FrameID.csv, .avi, .mat, and .txt files. Sorting files include any analyzer_*,
-kilosort4_output, preprocess, and sorting_summary_* folders, as well as the binary_signals.npz file in the pynapple folder
+the ANID_YYYYMMDD_Timestamp.csv, ...FrameID.csv, .avi, .mat, and .txt files, and the preprocess folder--which is
+already in rec_folder and so is simply left there. Sorting files include any analyzer_*,
+kilosort4_output, and sorting_summary_* folders, as well as the binary_signals.npz file in the pynapple folder
 Analysis files include all original contents of the pynapple folder. A significant catch is that before files get moved
 around, the binary_signals.npz file should be moved to a new subfolder of rec_folder called "binary_signals" so that
 the binary signals can be easily copied to both the sorting and anlaysis folders.
@@ -24,7 +26,9 @@ stay put, like the rest of the raw data.
 move_rec_folder() does this for one rec_folder and move_subject_folder() for one an_ID folder; both report what they
 did, so a whole list of rec_folders can be moved in one run: a recording that is already moved, or in a partially-moved
 state, is skipped without aborting the others. move_rec_folders() takes just the list of rec_folders and moves each
-one's an_ID-level products too, once per animal.
+one's an_ID-level products too, once per animal. Since preprocess now stays put, a rec_folder whose only non-raw
+subfolder is preprocess has nothing this program needs to do, and reports 'nothing_to_move' rather than 'moved'.
+Sessions split under the older layout, with preprocess already in sorting_files, are put right by move_preprocess.py.
 The target layout itself is defined once in utils/file_structure.py, which is also what the pipeline now writes to.
 """
 
@@ -34,21 +38,12 @@ import shutil
 
 from utils import file_structure as fs
 
-#folders whose name contains any of these are left completely alone -- not moved, not scanned,
-#not reported on. Matching is case-insensitive and applies to every path component below the
-#category root, so an animal folder called "ignore" excludes everything under it. Pass
-#skip_substrings=() to any of the movers to turn this off
-SKIP_SUBSTRINGS = ("hidden", "ignore")
-
-
-def _skip_reason(names, skip_substrings):
-    """The first skip substring found in any of `names`, or None if none of them match."""
-    for name in names:
-        lowered = str(name).lower()
-        for substring in skip_substrings:
-            if substring.lower() in lowered:
-                return substring
-    return None
+#folders whose name contains any of these are left completely alone -- not moved, not scanned, not
+#reported on. Matching is case-insensitive and applies to every path component below the category
+#root, so an animal folder called "ignore" excludes everything under it. The rule lives in
+#file_structure.py so that every mover obeys the same one; pass skip_substrings=() to any of the
+#movers here to turn it off
+SKIP_SUBSTRINGS = fs.SKIP_SUBSTRINGS
 
 
 #every session folder under D:/experiment_data/recording_files, one per line. Folders
@@ -170,7 +165,7 @@ recording_files/
     │   ├── DS15_20260701.avi
     │   ├── DS15_20260701.mat
     │   ├── DS15_20260701.txt
-    │   ├── preprocess/                        <- sorting: preprocessed data
+    │   ├── preprocess/                        <- recording: preprocessed data (stays put)
     │   ├── kilosort4_output/                  <- sorting: kilosort spike sorting output
     │   ├── analyzer_DS15_20260701/            <- sorting: sorting analyzer (analyzer_*)
     │   ├── sorting_summary_DS15_20260701/     <- sorting: curation summary (sorting_summary_*)
@@ -193,12 +188,12 @@ root_folder/
 │       │   ├── DS15_20260701_142530_FrameID.csv
 │       │   ├── DS15_20260701.avi
 │       │   ├── DS15_20260701.mat
-│       │   └── DS15_20260701.txt
+│       │   ├── DS15_20260701.txt
+│       │   └── preprocess/                   <- preprocessed data, left where it already was
 │       └── HSOMBS_DS15_20260701.mat          <- an_ID-level raw file, left in place
 ├── sorting_files/                            <- spike-sorting pipeline products
 │   └── DS15/
 │       └── DS15_20260701/
-│           ├── preprocess/
 │           ├── kilosort4_output/
 │           ├── analyzer_DS15_20260701/
 │           ├── sorting_summary_DS15_20260701/
@@ -235,7 +230,7 @@ def move_rec_folder(rec_folder, skip_substrings=SKIP_SUBSTRINGS):
     # 1.1b: a session parked under a name like "ignore" is off limits, as is one whose animal
     #       folder is. checking rec_ID rather than the whole path keeps the test to the part of
     #       the tree this program owns, so a root folder that happens to contain the word is fine
-    skipped = _skip_reason(folders.rec_ID.parts, skip_substrings)
+    skipped = fs.skip_reason(folders.rec_ID.parts, skip_substrings)
     if skipped:
         print(f"Skipping: path contains {skipped!r}.")
         return 'skipped'
@@ -261,7 +256,7 @@ def move_rec_folder(rec_folder, skip_substrings=SKIP_SUBSTRINGS):
     # Part 2 / Phase 1: identify the current filestructure of rec_folder. a subfolder whose own
     # name is marked stays put, so e.g. preprocess_ignore is left where it is
     rec_subfolders = [f for f in rec_folder.iterdir()
-                      if f.is_dir() and not _skip_reason([f.name], skip_substrings)]
+                      if f.is_dir() and not fs.skip_reason([f.name], skip_substrings)]
     sort_origin_subfolders = [f for f in rec_subfolders
                               if any(f.name.startswith(p) for p in fs.SORTING_SUBFOLDER_PREFIXES)]
     analysis_origin_subfolders = [f for f in rec_subfolders
@@ -319,7 +314,9 @@ def move_rec_folder(rec_folder, skip_substrings=SKIP_SUBSTRINGS):
     # 3.2: create the sorting and analysis destination folders (parents included)
     folders.create_output_folders()
 
-    # 3.3: move the sorting subfolders (analyzer_*, sorting_summary_*, kilosort*, preprocess) into sorting_files
+    # 3.3: move the sorting subfolders (analyzer_*, sorting_summary_*, kilosort*) into sorting_files.
+    #      preprocess is not among them: it is a recording file, and rec_folder is already the
+    #      recording folder, so it stays exactly where it is
     for f in sort_origin_subfolders:
         print(f"  moving {f.name} -> {sort_dest}")
         shutil.move(str(f), str(sort_dest / f.name))
@@ -353,7 +350,7 @@ def move_subject_folder(an_folder, skip_substrings=SKIP_SUBSTRINGS):
     print(f"\n=== {an_folder} (an_ID level)")
 
     _, _, rel_ID = fs.split_category_path(an_folder)
-    skipped = _skip_reason(rel_ID.parts, skip_substrings)
+    skipped = fs.skip_reason(rel_ID.parts, skip_substrings)
     if skipped:
         print(f"Skipping: path contains {skipped!r}.")
         return 'skipped'
@@ -363,7 +360,7 @@ def move_subject_folder(an_folder, skip_substrings=SKIP_SUBSTRINGS):
 
     # 2: which subfolders here are cross-session analysis products
     an_subfolders = [f for f in an_folder.iterdir()
-                     if f.is_dir() and not _skip_reason([f.name], skip_substrings)]
+                     if f.is_dir() and not fs.skip_reason([f.name], skip_substrings)]
     subject_origin_subfolders = [f for f in an_subfolders
                                  if any(f.name.startswith(p) for p in fs.SUBJECT_ANALYSIS_SUBFOLDER_PREFIXES)]
     origin_exists = bool(subject_origin_subfolders)

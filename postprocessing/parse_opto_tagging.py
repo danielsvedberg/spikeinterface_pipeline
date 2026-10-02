@@ -1,9 +1,9 @@
 import pynapple as nap
 from pathlib import Path
 from preprocessing import parse_nidq as pni
+from utils.mpl_backend import select_backend
+select_backend()  # Qt in the main process, headless Agg in joblib workers
 import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Qt5Agg')
 from joblib import Parallel, delayed
 from tqdm import tqdm
 import numpy as np
@@ -529,42 +529,83 @@ def test():
 #chrimson_events_idx = chrimson_events_idx.index.tolist()
 
 
-def test_stim_firing(ephys_data, bs, opsins=None, post_window_ms=(1.0, 31.0),
-                     baseline_duration_s=1, baseline_gap_ms=1.0,
-                     baseline_bin_ms=10.0, alpha=0.05, save_folder=None):
+def _peak_count(spike_times, lo, hi, bin_s):
+    """Most spikes in any bin_s-long window inside [lo, hi) (spike_times sorted).
+
+    The busiest window can always be taken to start on a spike, so it is the largest count of
+    spikes in [s, s + bin_s) over the spikes s in the window; spikes past hi are not counted.
     """
-    For each unit and each opsin, test whether post-stimulus firing
-    (1–31 ms after each opto-on event) is significantly elevated compared
-    to a pre-stimulus baseline using the Mann–Whitney U test, and plot a
-    bar graph of baseline vs evoked firing rate for every unit.
+    s = spike_times[np.searchsorted(spike_times, lo):np.searchsorted(spike_times, hi)]
+    if s.size == 0:
+        return 0
+    return int((np.searchsorted(s, s + bin_s, 'left') - np.arange(s.size)).max())
 
-    Baseline: for a given opsin, collect **all** on-event times across every
-    power level.  For each on-event, take the window from −*baseline_duration_s*
-    to −*baseline_gap_ms* ms before onset, divide into non-overlapping
-    *baseline_bin_ms*-ms bins, and count spikes in each.  This shared baseline
-    distribution is used for all power-level comparisons of that opsin.
 
-    Post-stimulus: the spike count in the [post_window_ms[0], post_window_ms[1]]
-    ms window after each opto-on event (one count per trial per power).
+def classify_opsin_response(ch_sig, c2_sig, ch_gt_c2):
+    """Cell type from which opsins drive a unit, under the opsins' asymmetric selectivity.
 
-    All counts are converted to firing rates (Hz) by dividing by bin width.
+    ChR2 is close to blind to orange light, so a dSPN has to show no orange-light response at
+    all. Chrimson is somewhat blue-light sensitive, so an iSPN may also answer blue light, as
+    long as it answers orange light more strongly. Anything else driven by both -- equal
+    responses, or blue preferred alongside a real orange response -- is muSPN.
+
+    ch_sig, c2_sig : the unit responds to that opsin's light
+    ch_gt_c2       : its orange response is larger than its blue one
+    """
+    if ch_sig and c2_sig:
+        return 'iSPN' if ch_gt_c2 else 'muSPN'
+    if ch_sig:
+        return 'iSPN'
+    if c2_sig:
+        return 'dSPN'
+    return np.nan
+
+
+def test_stim_firing(ephys_data, bs, opsins=None, response_window_ms=None, peak_bin_ms=10.0,
+                     skip_ms=1.0, alpha=0.05, save_folder=None):
+    """
+    For each unit and opsin, test whether the light pulses drive firing, and label the cell
+    type from which opsins do (classify_opsin_response).
+
+    Response: per pulse, the peak firing rate over any *peak_bin_ms* window in the response
+    window -- from *skip_ms* after onset (past the light-onset artifact) to the end of the pulse
+    by default -- so a unit that adapts during the pulse is scored by its strongest moment, not
+    diluted over the whole pulse.
+
+    Baseline: the same statistic over a window of the same length ending *skip_ms* before the
+    same pulse. Response and baseline are therefore measured identically, and each pulse is
+    its own control (the comparison is paired, so slow changes in the unit's rate cancel).
+
+    Tests, per unit:
+      * per opsin, peak during the pulse > peak before it (one-sided Wilcoxon signed-rank)
+      * orange response > blue response, the response being peak minus its own baseline peak
+        (one-sided Mann-Whitney U), which decides a unit driven by both
+      * dose-response: Spearman rho of the peak against power (baseline peaks at power 0),
+        one-sided, rho > 0
+
+    A unit responds to an opsin when both the first and the last test say so: the response
+    has to rise with power. At low power the orange LED flickers and the flicker can induce a
+    noise artifact, strongest at the lowest power and fading as the power goes up; requiring a
+    rising dose-response keeps that from reading as an orange-light response, while a real
+    response -- even one already saturated at the lowest power -- sits above the baseline at
+    every power and passes.
 
     Parameters
     ----------
     ephys_data : nap.TsGroup-like
         Spike trains keyed by unit id.
     bs : object
-        Binary-signals object with ``.metadata`` and ``bs[idx]`` access.
+        Binary-signals object with ``.metadata`` and ``bs[idx]`` access; pulses are the
+        ``<opsin>_on_<power>`` events, their ends the matching ``<opsin>_off_<power>`` events.
     opsins : list of str or None
         Opsin prefixes to test (default ``['chrimson', 'chr2']``).
-    post_window_ms : tuple of float
-        (start, end) of the post-stimulus counting window in ms (default 1–31).
-    baseline_duration_s : float
-        Seconds before stimulus onset used for baseline (default 5).
-    baseline_gap_ms : float
-        Dead-zone between baseline end and stimulus onset in ms (default 1).
-    baseline_bin_ms : float
-        Width of each baseline bin in ms (default 30, matching post window).
+    response_window_ms : (start, end) or None
+        Response window in ms after pulse onset. None: (*skip_ms*, the opsin's median pulse
+        duration).
+    peak_bin_ms : float
+        Width of the window the peak rate is taken over (default 10 ms).
+    skip_ms : float
+        Time skipped after onset, and the gap between the baseline window and onset.
     alpha : float
         Significance threshold (default 0.05).
     save_folder : Path or None
@@ -574,290 +615,135 @@ def test_stim_firing(ephys_data, bs, opsins=None, post_window_ms=(1.0, 31.0),
     Returns
     -------
     results_df : pandas.DataFrame
-        One row per unit × opsin with columns:
-        ``['unit', 'opsin', 'power', 'n_trials', 'rate_post_hz',
-          'rate_baseline_hz', 'U_stat', 'p_value', 'significant']``
+        One row per unit x opsin x power: ``['unit', 'opsin', 'power', 'n_trials',
+        'rate_post_hz', 'rate_baseline_hz', 'p_value', 'significant']``, rates being mean peak
+        rates.
     summary_df : pandas.DataFrame
-        One row per unit.  Contains two sets of columns:
-
-        *MWU comparisons* (pooled-trial post vs baseline):
-        ``mwu_stat/pval_chrimson_vs_baseline``,
-        ``mwu_stat/pval_chr2_vs_baseline``,
-        ``mwu_stat/pval_chrimson_vs_chr2``,
-        ``mwu_stat/pval_chrimson_baseline_vs_chr2_baseline``,
-        ``tagged``.
-
-        *Spearman dose-response* (rate ~ power, including power=0 baseline):
-        ``spearman_rho_chrimson``, ``spearman_pval_chrimson`` (one-sided, H1: ρ>0),
-        ``spearman_rho_chr2``,     ``spearman_pval_chr2``,
-        ``delta_rho`` (ρ_chrimson − ρ_chr2),
-        ``fisher_z_stat``, ``fisher_z_pval`` (two-sided, tests whether the
-        two dose-response slopes are significantly different).
-
-        *Hierarchical cell-type label*:
-        ``dominant_opsin``, ``cell_type`` —
-        'iSPN' (chrimson-specific), 'dSPN' (chr2-specific),
-        'muSPN' (both significant but indistinguishable), NaN (not tagged).
+        One row per unit: ``p_<opsin>_vs_baseline``, ``resp_<opsin>_hz`` (mean peak minus
+        baseline peak), ``peak_rho_<opsin>`` / ``peak_rho_p_<opsin>`` (dose-response),
+        ``responds_<opsin>`` (both significant), ``p_chrimson_gt_chr2``,
+        ``window_ms_<opsin>``, ``tagged`` and ``cell_type``.
     """
     import re
     import pandas as pd
-    from scipy.stats import mannwhitneyu, spearmanr, norm as _norm
+    from scipy.stats import mannwhitneyu, wilcoxon, spearmanr
     from pathlib import Path
 
     if opsins is None:
         opsins = ['chrimson', 'chr2']
-
     bs_metadata = bs.metadata
-    post_start_s = post_window_ms[0] / 1000.0
-    post_end_s = post_window_ms[1] / 1000.0
-    post_bin_s = post_end_s - post_start_s
-    baseline_bin_s = baseline_bin_ms / 1000.0
-    baseline_gap_s = baseline_gap_ms / 1000.0
+    bin_s = peak_bin_ms / 1000.0
+    skip_s = skip_ms / 1000.0
 
-    def _extr_power(s):
-        m = re.search(r"(\d+)$", str(s))
-        return int(m.group(1)) if m else None
+    def _ts(idx):
+        o = bs[idx]
+        return np.asarray(o.t if hasattr(o, 't') else o.index, dtype=float)
 
-    # ---- set up save folder ----
     if save_folder is not None:
         plot_folder = Path(save_folder) / "stim_firing_plots"
         plot_folder.mkdir(parents=True, exist_ok=True)
     else:
         plot_folder = None
 
-    records = []
-    # raw_rates[(unit, opsin)] = {'post', 'baseline', 'trial_powers', 'trial_baseline_means'}
-    raw_rates = {}
-
-    # Pre-collect per-opsin onset times AND their associated power levels
+    # ---- per opsin: pulse onsets, their powers, and the response window ----
     opsin_info = {}
+    events = dict(zip(bs_metadata['event'], bs_metadata.index))
     for opsin in opsins:
-        on_mask = bs_metadata['event'].str.contains(f'{opsin}_on', na=False)
-        on_events_df = bs_metadata[on_mask].copy()
-        if on_events_df.empty:
+        onsets, powers, durations = [], [], []
+        for name, idx in events.items():
+            m = re.fullmatch(rf'{opsin}_on_(\d+)', str(name))
+            if m is None:
+                continue
+            on = _ts(idx)
+            onsets.append(on)
+            powers.append(np.full(len(on), float(m.group(1))))
+            off_idx = events.get(f'{opsin}_off_{m.group(1)}')
+            if off_idx is not None and len(on):
+                off = _ts(off_idx)
+                nxt = np.searchsorted(off, on)
+                ok = nxt < len(off)
+                durations.append(off[nxt[ok]] - on[ok])
+        if not onsets or not np.concatenate(onsets).size:
             continue
-        on_events_df['power'] = on_events_df['event'].apply(_extr_power)
-        on_events_df = on_events_df.dropna(subset=['power'])
+        on, pw = np.concatenate(onsets), np.concatenate(powers)
+        order = np.argsort(on)
+        if response_window_ms is not None:
+            lo, hi = response_window_ms[0] / 1000.0, response_window_ms[1] / 1000.0
+        else:
+            dur = np.concatenate(durations) if durations else np.array([])
+            if not dur.size:
+                raise ValueError(f'no {opsin}_off events to take the pulse duration from; '
+                                 'pass response_window_ms')
+            lo, hi = skip_s, float(np.median(dur))
+        opsin_info[opsin] = {'onsets': on[order], 'powers': pw[order], 'lo': lo, 'hi': hi}
 
-        all_onsets = []
-        all_powers_per_onset = []
-        for idx in on_events_df.index:
-            power = on_events_df.loc[idx, 'power']
-            ts_obj = bs[idx]
-            if hasattr(ts_obj, 't'):
-                onsets_for_event = ts_obj.t.tolist()
-            elif hasattr(ts_obj, 'index'):
-                onsets_for_event = ts_obj.index.tolist()
-            else:
-                onsets_for_event = []
-            all_onsets.extend(onsets_for_event)
-            all_powers_per_onset.extend([float(power)] * len(onsets_for_event))
+    def _paired_greater(a, b):
+        d = np.asarray(a, float) - np.asarray(b, float)
+        if len(d) < 2 or not np.any(d):
+            return np.nan if len(d) < 2 else 1.0
+        try:
+            return float(wilcoxon(a, b, alternative='greater', zero_method='zsplit').pvalue)
+        except ValueError:
+            return np.nan
 
-        if len(all_onsets) == 0:
-            continue
-        sort_idx = np.argsort(all_onsets)
-        opsin_info[opsin] = {
-            'all_onsets': np.array(all_onsets)[sort_idx],
-            'all_powers': np.array(all_powers_per_onset)[sort_idx],
-        }
+    def _mwu_greater(a, b):
+        if len(a) < 2 or len(b) < 2:
+            return np.nan
+        try:
+            return float(mannwhitneyu(a, b, alternative='greater').pvalue)
+        except ValueError:
+            return np.nan
 
-    # ---- main loop: per unit ----
-    units = list(ephys_data.keys())
-    for unit in units:
-        spike_times = np.asarray(ephys_data[unit].index)
-
+    records, summary_records = [], []
+    for unit in ephys_data.keys():
+        spike_times = np.sort(np.asarray(ephys_data[unit].index, dtype=float))
+        row = {'unit': unit}
+        resp = {}
         for opsin, info in opsin_info.items():
-            all_onsets = info['all_onsets']
-            all_powers = info['all_powers']
-
-            # --- shared baseline: bins in [-baseline_duration_s, -baseline_gap_ms] ---
-            n_bins_per_trial = int(baseline_duration_s / baseline_bin_s)
-            baseline_counts = []
-            for onset in all_onsets:
-                bl_end = onset - baseline_gap_s
-                bl_start = bl_end - baseline_duration_s
-                for b in range(n_bins_per_trial):
-                    bin_lo = bl_start + b * baseline_bin_s
-                    bin_hi = bin_lo + baseline_bin_s
-                    cnt = int(np.sum(
-                        (spike_times >= bin_lo) & (spike_times < bin_hi)
-                    ))
-                    baseline_counts.append(cnt)
-            baseline_counts = np.array(baseline_counts)
-            baseline_rates = baseline_counts / baseline_bin_s  # Hz (all bins)
-
-            # Per-trial mean baseline rate (one per onset, for Spearman at power=0)
-            trial_baseline_means = np.array([
-                int(np.sum((spike_times >= (onset - baseline_gap_s - baseline_duration_s))
-                           & (spike_times < (onset - baseline_gap_s))))
-                / baseline_duration_s
-                for onset in all_onsets
-            ], dtype=float)
-
-            # --- post-stimulus counts (one per trial) ---
-            post_counts = np.empty(len(all_onsets), dtype=int)
-            for i, onset in enumerate(all_onsets):
-                win_start = onset + post_start_s
-                win_end = onset + post_end_s
-                post_counts[i] = int(np.sum(
-                    (spike_times >= win_start) & (spike_times < win_end)
-                ))
-            post_rates = post_counts / post_bin_s  # Hz
-
-            raw_rates[(unit, opsin)] = {
-                'post':                 post_rates,
-                'baseline':             baseline_rates,
-                'trial_powers':         all_powers,
-                'trial_post_rates':     post_rates,
-                'trial_baseline_means': trial_baseline_means,
-            }
-
-            # --- Mann-Whitney U (one-sided: post > baseline) ---
-            if len(post_rates) > 0 and len(baseline_rates) > 0:
-                try:
-                    u_stat, p_val = mannwhitneyu(
-                        post_rates, baseline_rates, alternative='greater'
-                    )
-                except ValueError:
-                    u_stat, p_val = np.nan, 1.0
+            lo, hi = info['lo'], info['hi']
+            length = hi - lo
+            stim = np.array([_peak_count(spike_times, t + lo, t + hi, bin_s)
+                             for t in info['onsets']]) / bin_s
+            base = np.array([_peak_count(spike_times, t - skip_s - length, t - skip_s, bin_s)
+                             for t in info['onsets']]) / bin_s
+            resp[opsin] = stim - base
+            p = _paired_greater(stim, base)
+            row[f'p_{opsin}_vs_baseline'] = p
+            row[f'resp_{opsin}_hz'] = float(np.mean(stim - base))
+            row[f'window_ms_{opsin}'] = (round(lo * 1000, 2), round(hi * 1000, 2))
+            x = np.concatenate([np.zeros(len(base)), info['powers']])
+            y = np.concatenate([base, stim])
+            if len(np.unique(y)) > 1:
+                rho, p_two = spearmanr(x, y)
+                row[f'peak_rho_{opsin}'] = float(rho)
+                row[f'peak_rho_p_{opsin}'] = float(p_two / 2 if rho > 0 else 1 - p_two / 2)
             else:
-                u_stat, p_val = np.nan, 1.0
-
-            records.append({
-                'unit': unit,
-                'opsin': opsin,
-                'power': 'all',
-                'n_trials': len(all_onsets),
-                'rate_post_hz': float(np.mean(post_rates)),
-                'rate_baseline_hz': float(np.mean(baseline_rates)),
-                'U_stat': u_stat,
-                'p_value': p_val,
-                'significant': p_val < alpha,
-            })
+                row[f'peak_rho_{opsin}'], row[f'peak_rho_p_{opsin}'] = np.nan, np.nan
+            for power in np.unique(info['powers']):
+                sel = info['powers'] == power
+                pp = _paired_greater(stim[sel], base[sel])
+                records.append({'unit': unit, 'opsin': opsin, 'power': power,
+                                'n_trials': int(sel.sum()),
+                                'rate_post_hz': float(np.mean(stim[sel])),
+                                'rate_baseline_hz': float(np.mean(base[sel])),
+                                'p_value': pp,
+                                'significant': bool(pp < alpha) if not np.isnan(pp) else False})
+        for opsin in opsin_info:
+            row[f'responds_{opsin}'] = bool(row[f'p_{opsin}_vs_baseline'] < alpha
+                                            and row[f'peak_rho_p_{opsin}'] < alpha)
+        p_gt = (_mwu_greater(resp['chrimson'], resp['chr2'])
+                if 'chrimson' in resp and 'chr2' in resp else np.nan)
+        row['p_chrimson_gt_chr2'] = p_gt
+        cell_type = classify_opsin_response(row.get('responds_chrimson', False),
+                                            row.get('responds_chr2', False), bool(p_gt < alpha))
+        row['tagged'] = isinstance(cell_type, str)
+        row['cell_type'] = cell_type
+        summary_records.append(row)
 
     results_df = pd.DataFrame(records)
-
-    # ---- Spearman dose-response helpers ----
-    def _spearman_one_sided(powers, rates):
-        """Spearman ρ(power, rate), one-sided p-value testing ρ > 0."""
-        if len(powers) < 4:
-            return np.nan, np.nan
-        rho, p_two = spearmanr(powers, rates)
-        p_one = float(p_two / 2) if rho > 0 else float(1.0 - p_two / 2)
-        return float(rho), p_one
-
-    def _fisher_z_test(rho1, n1, rho2, n2):
-        """Two-sided Fisher z-test comparing two Spearman correlations."""
-        if np.isnan(rho1) or np.isnan(rho2) or n1 < 4 or n2 < 4:
-            return np.nan, np.nan
-        z1 = np.arctanh(np.clip(rho1, -0.9999, 0.9999))
-        z2 = np.arctanh(np.clip(rho2, -0.9999, 0.9999))
-        se = np.sqrt(1.0 / (n1 - 3) + 1.0 / (n2 - 3))
-        z_diff = (z1 - z2) / se
-        p_two = float(2.0 * _norm.sf(abs(z_diff)))
-        return float(z_diff), p_two
-
-    # ---- per-unit summary ----
-    def _mwu(a, b, alternative='two-sided'):
-        if len(a) >= 2 and len(b) >= 2:
-            try:
-                res = mannwhitneyu(a, b, alternative=alternative)
-                return float(res.statistic), float(res.pvalue)
-            except ValueError:
-                pass
-        return np.nan, np.nan
-
-    summary_records = []
-    for unit in units:
-        ch  = raw_rates.get((unit, 'chrimson'), {})
-        c2  = raw_rates.get((unit, 'chr2'),     {})
-        ch_post = ch.get('post',     np.array([]))
-        ch_bl   = ch.get('baseline', np.array([]))
-        c2_post = c2.get('post',     np.array([]))
-        c2_bl   = c2.get('baseline', np.array([]))
-
-        # Existing MWU comparisons
-        u_ch_bl, p_ch_bl = _mwu(ch_post, ch_bl,  alternative='greater')
-        u_c2_bl, p_c2_bl = _mwu(c2_post, c2_bl,  alternative='greater')
-        u_ch_c2, p_ch_c2 = _mwu(ch_post, c2_post, alternative='two-sided')
-        u_bl_bl, p_bl_bl = _mwu(ch_bl,   c2_bl,   alternative='two-sided')
-
-        opsin_vs_bl_sig = (
-            (not np.isnan(p_ch_bl) and p_ch_bl < alpha) or
-            (not np.isnan(p_c2_bl) and p_c2_bl < alpha)
-        )
-        tagged = bool(opsin_vs_bl_sig and (not np.isnan(p_ch_c2) and p_ch_c2 < alpha))
-
-        # Spearman dose-response: combine stim trials (power > 0) with
-        # per-trial mean baseline (power = 0) to anchor the curve.
-        ch_powers = np.concatenate([np.zeros(len(ch.get('trial_baseline_means', []))),
-                                    ch.get('trial_powers', np.array([]))])
-        ch_rates  = np.concatenate([ch.get('trial_baseline_means', np.array([])),
-                                    ch.get('trial_post_rates',     np.array([]))])
-        c2_powers = np.concatenate([np.zeros(len(c2.get('trial_baseline_means', []))),
-                                    c2.get('trial_powers', np.array([]))])
-        c2_rates  = np.concatenate([c2.get('trial_baseline_means', np.array([])),
-                                    c2.get('trial_post_rates',     np.array([]))])
-
-        rho_ch, p_rho_ch = _spearman_one_sided(ch_powers, ch_rates)
-        rho_c2, p_rho_c2 = _spearman_one_sided(c2_powers, c2_rates)
-
-        delta_rho = (float(rho_ch) - float(rho_c2)
-                     if not (np.isnan(rho_ch) or np.isnan(rho_c2)) else np.nan)
-        fisher_z, fisher_pval = _fisher_z_test(rho_ch, len(ch_powers),
-                                                rho_c2, len(c2_powers))
-
-        # Hierarchical cell-type label
-        ch_sig     = (not np.isnan(p_rho_ch)  and p_rho_ch  < alpha)
-        c2_sig     = (not np.isnan(p_rho_c2)  and p_rho_c2  < alpha)
-        fisher_sig = (not np.isnan(fisher_pval) and fisher_pval < alpha)
-
-        if ch_sig and not c2_sig:
-            cell_type = 'iSPN'
-        elif c2_sig and not ch_sig:
-            cell_type = 'dSPN'
-        elif ch_sig and c2_sig:
-            if fisher_sig:
-                cell_type = 'iSPN' if (not np.isnan(delta_rho) and delta_rho > 0) else 'dSPN'
-            else:
-                cell_type = 'muSPN'
-        else:
-            cell_type = np.nan
-
-        dominant_opsin = None
-        if fisher_sig and not np.isnan(delta_rho):
-            dominant_opsin = 'chrimson' if delta_rho > 0 else 'chr2'
-
-        summary_records.append({
-            'unit': unit,
-            # MWU comparisons (kept for backwards compatibility)
-            'mwu_stat_chrimson_vs_baseline':               u_ch_bl,
-            'mwu_pval_chrimson_vs_baseline':               p_ch_bl,
-            'mwu_stat_chr2_vs_baseline':                   u_c2_bl,
-            'mwu_pval_chr2_vs_baseline':                   p_c2_bl,
-            'mwu_stat_chrimson_vs_chr2':                   u_ch_c2,
-            'mwu_pval_chrimson_vs_chr2':                   p_ch_c2,
-            'mwu_stat_chrimson_baseline_vs_chr2_baseline': u_bl_bl,
-            'mwu_pval_chrimson_baseline_vs_chr2_baseline': p_bl_bl,
-            'tagged': tagged,
-            # Spearman dose-response
-            'spearman_rho_chrimson':  rho_ch,
-            'spearman_pval_chrimson': p_rho_ch,
-            'spearman_rho_chr2':      rho_c2,
-            'spearman_pval_chr2':     p_rho_c2,
-            'delta_rho':              delta_rho,
-            'fisher_z_stat':          fisher_z,
-            'fisher_z_pval':          fisher_pval,
-            'dominant_opsin':         dominant_opsin,
-            'cell_type':              cell_type,
-        })
-
     summary_df = pd.DataFrame(summary_records)
-
-    # ---- bar-graph per unit ----
     if len(results_df) > 0:
         _plot_stim_firing_bars(results_df, plot_folder, alpha)
-
     return results_df, summary_df
 
 
@@ -891,8 +777,8 @@ def _plot_stim_firing_bars(results_df, plot_folder, alpha=0.05):
         width = 0.35
 
         fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.4), 5))
-        bars_bl = ax.bar(x - width / 2, baseline_vals, width, label='Baseline', color='grey', alpha=0.7)
-        bars_po = ax.bar(x + width / 2, post_vals, width, label='Post-stim (1–31 ms)', color='steelblue')
+        bars_bl = ax.bar(x - width / 2, baseline_vals, width, label='Baseline (peak 10 ms rate)', color='grey', alpha=0.7)
+        bars_po = ax.bar(x + width / 2, post_vals, width, label='Pulse (peak 10 ms rate)', color='steelblue')
 
         # annotate significant comparisons
         y_max = max(np.max(baseline_vals), np.max(post_vals)) if len(baseline_vals) > 0 else 1
@@ -1298,23 +1184,20 @@ def plot_time_to_first_spike_distribution(ephys_data, bs, save_folder=None, max_
     )
 
     # cell_type: hierarchical labelling
+    #   (an opsin counts only with a significant POSITIVE coefficient: faster spiking)
     #   1. one opsin significant, other not → label by the significant one
-    #   2. both significant + LRT significant → label by stronger slope
-    #   3. both significant + LRT not significant → 'muSPN' (ambiguous)
+    #   2. both significant: 'iSPN' if the LRT finds the chrimson slope steeper, otherwise
+    #      'muSPN' (see classify_opsin_response for the opsins' asymmetric selectivity)
     #   4. neither significant → NaN (not tagged)
     def _cell_type(row):
-        ch  = row['p_power_chrimson'] < alpha
-        c2  = row['p_power_chr2']     < alpha
+        # a tagging response makes the unit fire sooner as the power goes up (a positive
+        # coefficient); a significant negative one is light delaying its spikes -- inhibition
+        ch  = row['p_power_chrimson'] < alpha and row['coef_power_chrimson'] > 0
+        c2  = row['p_power_chr2']     < alpha and row['coef_power_chr2']     > 0
         lrt = row['lrt_pval']         < alpha
-        if ch and not c2:
-            return 'iSPN'
-        if c2 and not ch:
-            return 'dSPN'
-        if ch and c2:
-            if lrt:
-                return 'iSPN' if row['delta_coef'] > 0 else 'dSPN'
-            return 'muSPN'
-        return np.nan
+        # driven by both: orange must win for iSPN (Chrimson answers some blue light); ChR2
+        # does not answer orange light, so blue winning is no dSPN
+        return classify_opsin_response(bool(ch), bool(c2), bool(lrt and row['delta_coef'] > 0))
 
     cox_df['cell_type'] = cox_df.apply(_cell_type, axis=1)
 
