@@ -83,7 +83,7 @@ def plot_compendium(sessions, ana_folders, comp_folder):
     pu.plot_cue_outcome_heatmap(
         ephys, binary_signals, trial_events,
         save_path=comp_folder / 'cue_outcome_heatmap.png',
-        ms_censored=50, clim=(0, 0.1),
+        ms_censored=50, clim=(0, 40),  # Hz
         zscore=False
     )
 
@@ -152,22 +152,25 @@ if __name__ == "__main__":
     #analysis_files folder rather than next to the raw recordings
     #save_folder = fs.category_path(subj_folder, fs.ANALYSIS_ROOT) / "compendium"
     #ana_folder = Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files")
-    ana_folder = Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files")
+    # every dataset now lives on D: (DS48 moved from C: on 2026-10-02)
+    ana_folder = Path(r"D:\experiment_data\analysis_files")
     comp_folder = ana_folder / "compendium"
 
-    ana_folders = [
-        #Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files\DS15\DS15_20260701"),
-        Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files\DS15\DS15_20260702"),
-        Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files\DS15\DS15_20260703"),
-        Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files\DS45\DS45_20260811"),
-        Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files\DS45\DS45_20260812"),
-        Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files\DS45\DS45_20260814"),
-        Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files\DS2\DS2_20260505"),
-        Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files\DS2\DS2_20260506"),
-        Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files\DS2\DS2_20260511")
-
-
-    ]
+    ana_folders = [ana_folder / s.split('_')[0] / s for s in (
+        #'DS15_20260701',
+        'DS15_20260702',
+        'DS15_20260703',
+        'DS45_20260811',
+        'DS45_20260812',
+        'DS45_20260814',
+        'DS2_20260505',
+        'DS2_20260506',
+        'DS2_20260511',
+        'DS48_20260921',
+        'DS48_20260922',
+        'DS48_20260923',
+        'DS48_20260924',
+    )]
     ana_folders = [fs.SessionPaths(f) for f in ana_folders]
     # --- per-session processing ---
     sessions = load_sessions(ana_folders)

@@ -95,6 +95,20 @@ mostly MUA in the id block 581–905. Older sessions show the same pattern (e.g.
 116). Decide whether these are real multi-unit clusters, splittable units, or over-strict
 quality criteria (failed criteria are in `spike_cleaning/unit_labels.csv`). Note: some of them
 may be duplicates (issue 1).
+- 2026-10-02, DS2 traced (user: "I've lost basically all the iSPNs from the old pipeline";
+  scratchpad `trace_ispn.py`, tables `trace/<session>/trace_<session>.csv`). The old pipeline's
+  10 DS2 iSPNs: 1 kept (0511 KS 205), 1 dropped at cleaning (0505 KS 542, bombcell noise:
+  peak_to_trough_duration 1.23 ms), 8 lost at QUALITY (bombcell mua / non_soma_mua). Tagging
+  lost none (new rules: 8 of the 9 surviving units still iSPN, 1 muSPN; all lick-bout
+  modulated). Criteria failed by all 40 old-tagged units lost at quality: rp_contamination 27,
+  snr 25, amplitude_median 17, presence_ratio 10, num_spikes 2. DS2 cannot meet bombcell's
+  snr >= 5 / amplitude >= 30 µV: session medians snr 3.6 / 2.7 / 3.2, amplitude 30 / 15 / 18 µV
+  (0505 / 0506 / 0511); snr < 5 for 277/429, 219/328, 279/385 units. The old pipeline used
+  KSLabel (refractory only). Odd: amplitude_median values are quantised in ~3.03 µV steps.
+  Two old 0505 iSPNs (KS 4, 545) had KSLabel mua — let in some other way (manual list?).
+  Options for the user: rig/probe-specific snr/amplitude thresholds (e.g. relative to each
+  session's noise), snr/amplitude as review flags only, or review the 8 by eye first (several
+  also have high refractory contamination, lower bounds 0.29–1.0).
 
 ### 4. `add_all_licks` reads events by position — fixed, awaiting re-analysis (2026-10-01)
 `analysis/pres_plot_utils.py:add_all_licks` takes `binary_signals[1]` and `[2]` as the first
@@ -190,6 +204,111 @@ differ). Then `parse_trials`: rewarded first lick = last lick <= solenoid_on, ea
   flat at ~34 GB total, ~8 min per session in parallel. (Diffs now list every event with
   "0 times moved": sub-ns differences between the recovered and original fit.)
 
+### 14. Many "noise" units dropped on peak_to_trough_duration alone — in progress: DS2 re-cleaning, other datasets TODO (2026-10-02)
+Found tracing the DS2 iSPNs: DS2_20260505 KS 542 (an old iSPN, 4,447 spikes) was dropped as
+bombcell noise only for peak_to_trough_duration = 1.23 ms (noise limit < 1.15 ms), yet its
+waveform is a clean positive-peaked spike whose peak and trough are ~0.2 ms apart on every
+channel (`spike_cleaning/noise_unit_plots/noise_unit_542.png`). Suspected: for a positive-
+polarity waveform the metric runs from the trough to the *next* peak, i.e. the slow recovery
+hump ~1.2 ms later. Scale (noise units dropped for this criterion alone): DS15 38/81/52/105;
+DS2 121/35/57; DS45 33/59/34/28/43/45; DS48 42/51/89/35 — ~950 units over 17 sessions, often
+half of each session's noise drops. They are only out of analyzer_clean (the raw analyzer has
+them), so a re-clean recovers them. Next: verify the metric on a sample (trough -> recovery-hump
+hypothesis, share of positive-peaked units), review a sheet of their noise plots with the user,
+then a polarity-aware duration (or exempt positive-peaked units) and re-clean.
+- 2026-10-02, user: "bombcell is way too conservative with classifying noise, unit 542, 548 look
+  like well isolated units". 548 (19,264 spikes) is a classic negative spike with a slow,
+  peakless recovery: duration 1.42 ms is the trough to wherever the flat tail peaks — so the
+  metric misfires on any waveform without a distinct after-peak, not just positive ones.
+  All 17 sessions: 2,696 noise units dropped; 1,775 failed exactly 1 criterion, 445 two,
+  476 three+. Criterion counts: peak_to_trough_duration 1,090, num_negative_peaks 1,065,
+  exp_decay 917, num_positive_peaks 586, peak_after_to_trough_ratio 469, baseline flatness 152.
+  Options put to the user: (1) noise only on >= 2 failed criteria; (2) fix the metrics (duration
+  to a prominent after-peak only, count only prominent peaks); (3) no noise drop, label as a
+  flag. Proposed first: a review sheet, ~20 random single-criterion drops per criterion.
+  Recovery needs a re-clean (outlier-score caches cover these units).
+- 2026-10-02, decided (user): peak_to_trough_duration removed from the noise criteria
+  (`spike_cleaning.NOISE_EXCLUDED_METRICS`, `default_thresholds()`, used everywhere the
+  bombcell defaults were). Why the metric fails, verified on the templates: SpikeInterface looks
+  for an after-peak of >= 40% (then 20%) of the waveform's largest deflection and, finding none,
+  takes the tail's global maximum — a 2–8 µV wobble ~1.4 ms out on slowly repolarising units.
+  The user preferred recovering units over a full re-clean; a re-clean with the cached outlier
+  scores is cheaper (SpikeInterface cannot combine two analyzers, so an incremental merge would
+  rebuild every unit's extensions) and leaves untouched units identical — agreed for DS2.
+  `clean_session` now re-cleans a session that already has analyzer_clean + _prev: the earlier
+  cleaning goes to `analyzer_clean_superseded` (delete once accepted).
+- Review sheets for the other single-criterion drops (user to decide):
+  `D:/experiment_data/noise_review/{exp_decay,peak_after_to_trough_ratio,num_negative_peaks}_review.png`
+  (+ `_sample.csv`), 20 random units each from all 17 sessions (351 / 253 / 214 such units).
+  First impression of the num_negative_peaks sheet: mostly real noise (flat, ringing).
+- 2026-10-02 ~19:15: **rerun started** (user: "Start it") for DS48, DS15 and DS45, run one
+  subject after another (scratchpad `rerun_noise_snr.sh`, logs `rerun_<subj>.log`):
+  - Clears the review-plot folders, then clean, summary, pynapple, isolate, ratio_tests and the
+    subject compendium.
+  - The clean step uses the new noise rule plus SNR 4 (covers issue 15 too) and keeps the
+    earlier cleaning as `analyzer_clean_superseded`.
+  - It was started before the user had reviewed the noise review sheets.
+- 2026-10-03, results:
+  - **DS48** (done 23:31, compendium ok). Good + non_soma_good / tagged:
+    - 0921: 60+3 / dSPN 12, iSPN 1, mu 1
+    - 0922: 91+4 / iSPN 18, dSPN 12, mu 15
+    - 0923: 109+20 / iSPN 27, dSPN 20, mu 12
+    - 0924: 92+1 / dSPN 17, iSPN 7, mu 2
+    - 144 tagged in total, was 109.
+  - **DS45** (done 06:50, compendium ok). Good + non_soma_good / tagged:
+    - 0811: 123+12 / dSPN 15, iSPN 5, mu 2
+    - 0812: 106+13 / dSPN 6, iSPN 2, mu 2
+    - 0814: 67+9 / dSPN 13, iSPN 2
+    - 0819: 71+6 / iSPN 4
+    - 0820: 108+11 / iSPN 9, mu 4
+    - 0821: 75+10 / iSPN 3
+  - **DS15:** the run died silently during 0702's ratio_tests plotting (no traceback; a native
+    crash like issue 7), so 0703 and 0707 never ran.
+    - 0701: 31 good / dSPN 2. 0702: 105+23 / iSPN 6, dSPN 6, mu 4.
+    - Finished on the second run (logs `rerun_DS15b/c.log`):
+      - 0703: 48+14 / dSPN 12, iSPN 1 (was dSPN 5, iSPN 1).
+      - 0707: 82+6 / iSPN 4, dSPN 1 (was iSPN 4).
+      - DS15 compendium over all four: ok.
+    - All datasets now use the same rules. Cross-dataset compendium (`compendium_plots.py`
+      __main__) queued after it.
+  - The "noise: 1–3" in the clean reports are units that the *final* bombcell pass calls noise.
+    Spike cleaning or a merge changed their waveform (mostly num_negative_peaks=2 or
+    exp_decay), and they were then dropped from analyzer_clean. They were mua or non_soma_mua
+    before. Not a bug.
+- **TODO: rerun the other datasets too** (DS48 0921–0924, DS15 0701/0702/0703/0707, DS45
+  0811–0821): `curate_subject --steps=clean,summary,pynapple,isolate,ratio_tests` per subject
+  (clear `spike_cleaning/{noise_unit_plots,removed_spike_plots,bimodal_split_plots,rp_review}`
+  first), ideally after the user has decided on the review sheets, so the noise rules change
+  once. DS2 is being re-cleaned now (2026-10-02 ~09:20).
+- 2026-10-02, DS2 done (re-clean + summary + pynapple + isolate + ratio_tests + compendium):
+  noise dropped 221->100 / 487->452 / 169->112, clean units 429->553 / 328->364 / 385->446
+  (0505 / 0506 / 0511); good+non_soma_good 73+5 / 31 / 52; tagged single units 0505 dSPN 12,
+  mu 1 | 0506 dSPN 2 | 0511 dSPN 7, iSPN 2, mu 2 (unchanged: the recovered units mostly fail
+  amplitude/snr, so possible false negatives rose to 294 / 206 / 167). DS2 compendium over all
+  three: 125 lick-bout modulated units. Old cleanings kept as `analyzer_clean_superseded`.
+
+### 15. SNR threshold 5 -> 4 — queued (2026-10-02)
+User agreed (dry run on DS2: good + non_soma_good 78->92, 31->34, 52->56; tagged units gained:
+0505 dSPN 695, 719, 833, 1283, 1359, 1393; 0511 iSPN 790 (old KS 157), dSPN 978, 1022 — each
+failed only SNR in [4, 5)). Reason: the noise level that SNR divides by is quantised (the probe
+stores 3.03 µV/bit and the background is only 3-5 bits wide, so the MAD estimate takes values
+4.5 / 9.0 / 13.5 µV) and DS2's units are smaller (median 15-27 µV vs 30-48 elsewhere).
+Applied: `spike_cleaning.MUA_SNR_MIN = 4` in `default_thresholds()`. DS2 relabel + summary,
+pynapple, isolate, ratio_tests + pooled compendium done (2026-10-02).
+- good + non_soma_good: 85+7 / 34 / 56 (was 73+5 / 31 / 52).
+- Tagged single units: 0505 dSPN 18, mu 1 (was dSPN 12); 0506 dSPN 2; 0511 dSPN 9, iSPN 3
+  (now includes 790), mu 2 (was dSPN 7, iSPN 2).
+- Awaiting the user's review. TODO: relabel DS48, DS15, DS45 too (can go
+with the issue-14 rerun). The refractory rule stays (685: spontaneous violations on a flat 1-3 ms
+floor = ~15-20% foreign spikes).
+Re-sort test 683/685 (scratchpad `pair_resort_test.py`, results in
+`sorting_files/DS2/DS2_20260505/unit_685_pca/resort_685_683.*`): no help. 685's lower bound is
+0.150 as sorted; it rises to 0.222 with hard reassignment and stays at 0.154 with a 0.05 margin.
+Dropping the ambiguous spikes gives 0.093, but that removes 31.6k of 128k spikes, and removing
+the same number of 685's spikes at random gives 0.130 (0.089-0.182), so it is no better than chance.
+683 gets worse under every reassignment. The two templates barely separate spikes by correlation.
+The foreign spikes in 685 are not 683's.
+
 ### 5. Curation + re-analysis batch on D: — done, awaiting the user's review (2026-10-02)
 Overnight run finished 03:55. Cleaning (clean units / good + non_soma_good): DS45 0814 269 /
 47+4, 0819 291 / 53+4, 0820 384 / 88+4, 0821 296 / 57+6; DS2 0505 429 / 68+3, 0506 328 / 30+0
@@ -275,10 +394,160 @@ Workaround: `curate_subject.py` redoes the step in-process on `TerminatedWorkerE
   Result: the DS45 compendium then completed (6 sessions, 25 figures) where it had crashed
   twice. Consistent with the stale cache, but one clean run is not proof — keep an eye out.
 
-### 8. Compendium session list points at C: copies — open (2026-10-01)
+### 8. Compendium session list points at C: copies — fixed (2026-10-02), now points at D: (issue 16)
 `analysis/compendium_plots.py`'s `__main__` list uses `C:\Users\assad\Desktop\experiment_data\
 analysis_files\{DS15,DS45,DS2}`, but the re-curation writes to the D: copies. The pooled
 cross-subject compendium is stale until the list points at D: (or the C: copies are refreshed).
+
+### 16. Move DS48 to D: for a cross-dataset compendium — done, awaiting acceptance (2026-10-02)
+**Done 19:05:**
+- Copied, and verified with the scratchpad `verify_ds48.py`: 61,870 + 11,647 + 208 files,
+  checked on size, mtime and content hash (whole file under 50 MB, first and last 64 MB above).
+  No file was missing or different apart from the known 0729 clash.
+- The C: copy of the clashing 0729 npz is kept on D: as `binary_signals_from_C.npz`.
+- Deleted `recording_files/DS48` and `sorting_files/DS48` from C: (C: free 25 -> 1049 GB).
+  `analysis_files/DS48` stays on C: as a copy.
+- All 4 sessions load from D: (analyzer_clean with recording, pynapple, binary_signals).
+- `compendium_plots.py` now points at `D:\experiment_data\analysis_files` with DS48 0921–0924
+  added; CLAUDE.md updated.
+- Caveat: DS48 / DS15 / DS45 are still curated under the old noise rule and SNR 5 (issues 14
+  and 15), so a cross-dataset compendium mixes criteria until they are rerun.
+
+Original request and plan:
+User asked for all of DS48 (recording 928 GB, sorting 97 GB, analysis 33 GB) to be moved from
+`C:\Users\assad\Desktop\experiment_data` to `D:\experiment_data`, keeping a copy of
+`analysis_files/DS48` on C:.
+- **Copy:** robocopy (scratchpad `copy_ds48.ps1`, logs in `copy_ds48/`), never overwriting
+  files already on D:. D: already had DS48 0717–0727 recordings and `DS48_20260729`
+  sorting/analysis. Both drives have a `sorting_files/DS48/DS48_20260729/binary_signals/binary_signals.npz`
+  and the two differ; the C: copy is not copied over.
+- **Paths:** analyzers and `preprocess` store relative paths, and `clean_sessions.load_analyzer`
+  re-attaches a moved recording, so the sessions should load from D:.
+- **Then:** verify; delete `recording_files/DS48` and `sorting_files/DS48` on C:; point
+  `compendium_plots.py` and the CLAUDE.md data layout at D: (see also issue 8).
+
+### 19. Units split by drift — in progress (2026-10-03)
+User: DS2_20260505 1599 and 1607 "are the same unit split in time" (then 1411/1417).
+**1599 / 1607 / 1609:**
+- Our bimodal split cut KS 605 at Kilosort's two ~6 um drift steps (~2000 s, ~2650 s).
+- The pieces are mutually refractory: pooled 54,792 spikes with 4 violations; 3 of 46 expected
+  coincidences across the 1599->1609 handover.
+- The merge step could not rejoin them: their template cosine is 0.67, under the 0.9 floor.
+
+**1411 / 1417** (KS 506 / 509, 23 um apart): not supported as one neuron. Both are active all
+session and coincide at chance in every 10-min window. Both are small and contaminated; 1411's
+violations rise over the session. Told the user; left as MUA.
+
+**Neighbour-pair scan** (scratchpad `neighbor_refractory.py`, 24k pairs within 40 um, expected >= 10):
+- Coincidence ratio median 1.47, 5th percentile 0.74, 1st percentile 0.36.
+- Close high-rate pairs sit at ~0.25-0.3, which looks like the sorter missing overlapping spikes.
+- Some pairs with unrelated templates are near 0. So refractoriness alone is not enough.
+
+**User chose option 1** (no re-sort). Implemented:
+- `sos.coincidences` / `sos.mutually_refractory`: at least 20 expected, at most 10% observed,
+  with the expectation time-resolved in 60-s bins.
+- `_bimodal_split` refuses a split whose clusters are mutually refractory (reason "one neuron:
+  ...").
+- New merge preset `DRIFT` (before REDUNDANT) for neighbours within 40 um that are mutually
+  refractory with template cosine >= 0.5. `_drift_merge_veto` checks every pair of a group;
+  pairs that never overlap may have at most 3 coincidences.
+- Kilosort drift per session (ops `dshift`): DS2 0506 130 um with a 50 um jump in 1 min (re-sort
+  candidate, option 3); DS2 0505 14 um; the rest 1-12 um.
+- Dry run 1 on DS2_20260505 (scratchpad `test_drift_0505.py`, nothing written). The 605 split
+  was refused (4 of 46.5 expected), so it is one non_soma_good unit (54,931 spikes, 4
+  violations). But two drift merges turned good units into MUA: 250+248 (lower bound 0.26) and
+  311+308 (138 violations). Their partners were contaminated themselves.
+  Added `_merged_rp_veto`: the pooled train must pass the labels' refractory rule
+  (`_rp_fails`; it agrees with the stored labels on all 553 units of 0505).
+- Dry run 2: good 85 + non_soma_good 7, the same as now. Changes:
+  - 605 is one unit again.
+  - 229+230/2 drift-merged (mua + mua -> mua, 5 violations; KS 230 is one of the user's
+    "two clusters" units).
+  - 1411/1417 (KS 506/509) unchanged.
+- 2026-10-03 21:14: **full rerun started** (user: "Rename it and let it rip").
+  - The 17 `analyzer_clean_superseded` folders were renamed `_superseded_2`.
+  - Script: scratchpad `rerun_drift.sh`, logs in `rerun_drift/<session>.log`.
+  - Per session: clean, summary, pynapple, each retried once on a crash.
+  - Then per subject: isolate, ratio_tests and the compendium. Then the cross-dataset compendium.
+  - DS2, DS48, DS15, DS45, in that order.
+- 2026-10-04 20:13, **rerun done**: all steps ok for 16 sessions, except DS2_20260505.
+  - **DS2_20260505:** its pynapple step failed because `singU_metadata.csv` was open in Excel,
+    after `spikes.npz` had already been cleared.
+    - Fixed: `curate_subject.pynapple_analysis` now skips a locked file with a warning, and
+      `isolate` writes `singU_metadata_new.csv` when the csv is locked.
+    - 0505's pynapple and isolate are being rerun, then the cross-dataset compendium.
+  - **Splits refused as one neuron:** DS2 0505 KS 605 (4 of 46 expected), DS2 0506 KS 442
+    (0 of 23), DS15 0702 KS 496 (0 of 26).
+  - **Drift merges:** DS2 0505 1027+1573 (229+230/2); DS2 0506 KS 402+413/1 (mua);
+    DS15 0702 496+487/2 (good, 10 violations); DS45 0811 1130+1152 (134/2+134/1/2);
+    DS45 0812 327+321/2 (good); DS45 0814 382+666; DS45 0820 756+772. The last four were
+    merged again by a later preset.
+  - **Tagged counts:** unchanged everywhere except:
+    - DS15 0702: dSPN 6 -> 7.
+    - DS2 0505: KS 605, whole again (unit 1521, non_soma_good), is a new **iSPN**.
+  - 21:40: DS2_20260505 fixed; the DS2 compendium and the cross-dataset compendium are rebuilt
+    (668 lick-bout modulated units, 25 figures). Awaiting the user's review.
+- Then
+  re-clean all 17 sessions. Note that `clean_session` refuses while `analyzer_clean_superseded`
+  exists (it does for every session after the noise rerun); the user must decide whether to
+  delete or rotate them.
+
+### 18. Cross-dataset compendium hung in the PSTH loops — fixed (2026-10-03)
+The 12-session pooled compendium (672 units) sat at 49 GB for over 10 min in
+`plot_spn_lick_bout_psth`.
+- **Cause:** a `np.histogram(spk - t)` over each unit's *whole* spike train for every
+  (event, unit) pair. The same loop was in 4 places in `analysis/pres_plot_utils.py`.
+- **Fix:** a new `event_counts()` that counts by binary search. It gives identical counts:
+  0 mismatching bins over DS2_20260505's 92 units x 439 bouts.
+- Separately: these PSTHs scaled counts as `h * bin_width` (count x 0.05), not a rate, though
+  their labels said spikes/s. User: "I would like psth bin counts/averages to be scaled to Hz".
+  **Fixed 2026-10-03:**
+  - All 18 sites in `pres_plot_utils.py` now use `/ bin_width`, including `compute_unit_z`,
+    so z-scores are unchanged. Checked: binned means equal spikes/s exactly.
+  - The 3 remaining per-trial histogram loops now use `event_counts` too.
+  - The raw `cue_outcome_heatmap` clim `(0, 0.1)` -> `(0, 40)` Hz (the same colour scale).
+  - `plot_psth.py` was already in Hz.
+  - Regenerated, all ok (12:02): every ratio_tests folder, the 4 subject compendia and the
+    cross-dataset compendium (`D:\experiment_data\analysis_files\compendium`, 25 figures).
+    Done with the scratchpad `replot_hz.py`.
+  - Still slow on the pooled data (41 min in all): `dspn_ispn_lick_bout_bar` and the
+    `dspn_ispn_bar_*` plots took ~25 min between them. Not looked at yet.
+
+### 17. Other datasets: re-sort readiness — surveyed, awaiting the user (2026-10-03)
+**How it was checked:**
+- Scratchpad `inventory.py` lists sort and curation dates; `inventory.csv` holds the table.
+- Scratchpad `check_parse.py` runs `get_binary_signals(overwrite=True, save=False)` with the
+  current parser, using an identity map in place of the imec clock fit unless a fit is cached.
+  Log: `check_parse.log`.
+
+**Parse OK with the current parser:**
+- DS13 0822, 0824 (no nidaq_map; the defaults work).
+- DS21 1209 1210 1211 1213. Sorted 2025-12-16 / 2026-03-17.
+- DS23 0208–0211. Sorted 2026-09-20..26.
+- DS37 031726 031826 031926 032126. Sorted 2026-09-20.
+- DS45 0813 (never sorted), DS15 0708 (never sorted).
+- DS1 1122 (no nidaq_map; never sorted).
+
+**Fail:**
+- DS1 1117–1120 (no nidaq_map): "Cue 0 does not precede its outcome". The defaults read the
+  tone and solenoid from analog channels, but DS1 has them on digital lines 3 and 2. With that
+  dinmap the tones parse, but opto fails (the GMM gets 0 samples on default analog channels
+  6/7). DS1 needs a nidaq_map.txt from the user.
+- DS13 0905 (no nidaq_map): "Multiple outcome tones found between cue at index 0".
+- DS21 1212: two SpikeGLX runs (g0, g1); the parser needs `gnum`.
+- Neptun 0625: no SpikeGLX folder.
+- DS48 0717–0729: behaviour/NIDQ only, no imec (0729 parses), so these cannot be sorted.
+
+**DS45_20260813 "always fails re-sort" — explained:**
+- The old duration-based tone classification raises `_package_tones` "Multiple outcome tones
+  found between cue at index 91 and next cue" (reproduced with `tone_method='duration'`).
+- At cue 91 (t = 2203.9 s) the timeout tone lasted 1.0 s instead of the usual 2.0 s (same
+  130 Hz pitch, 262 vs 526 edges, no gap).
+- The frequency parser (default since 2026-10-01) classifies it by pitch. The full call the
+  re-sort makes (`plot=True`, real clock fit 0.999997298 / +0.29 ms) now parses: 118 trials,
+  8 rewards, 10 errors, 100 timeouts.
+- The session's notes call it a "complete disaster" (mouse not engaged), with a second run
+  `g1` parked in `hidden/`.
 
 ### 9. DS48_20260924 drops many close spike pairs — open (2026-09-30)
 Its cleaning removed 186,757 spikes as pairs <= 1 ms (~0.6% of 31M), far more than the other

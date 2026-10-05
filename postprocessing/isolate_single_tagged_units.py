@@ -186,7 +186,9 @@ def isolate_single_tagged_units(analysis_folder, quality_label='kilosort'):
         singU_metadata.rename_axis('unit').to_csv(csv_file)
         print(f"[{tag}] wrote metadata for {len(singU_metadata)} units to {csv_file}")
     except OSError as e:
-        print(f"[{tag}] could not write {csv_file}: {type(e).__name__}: {e}")
+        alt = csv_file.with_name('singU_metadata_new.csv')
+        singU_metadata.rename_axis('unit').to_csv(alt)
+        print(f"[{tag}] could not write {csv_file} ({type(e).__name__}: {e}); wrote {alt} instead")
 
     return {'ephys_metadata': ephys_metadata, 'singU_metadata': singU_metadata,
             'best_tagged': best_tagged, 'poss_fn': poss_fn}

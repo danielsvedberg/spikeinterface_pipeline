@@ -422,6 +422,19 @@ def get_task_interval(binary_signals, trial_events=None, exclude_opto=True):
     return ref_ep
 
 
+def event_counts(spike_times, ref_times, edges):
+    """Spike counts in `edges` around each reference time, shape (len(ref_times), len(edges) - 1).
+
+    Same as np.histogram(spike_times - t, bins=edges) for every t (last bin closed), but by
+    binary search on the sorted spike train instead of a pass over every spike per event --
+    pooled sessions have thousands of events and units."""
+    spk = np.asarray(spike_times)
+    bounds = np.asarray(ref_times, dtype=float)[:, None] + np.asarray(edges)[None, :]
+    idx = np.searchsorted(spk, bounds, side='left')
+    idx[:, -1] = np.searchsorted(spk, bounds[:, -1], side='right')
+    return np.diff(idx, axis=1)
+
+
 def compute_unit_z(ephys, binary_signals, trial_events, bin_width, exclude_opto=True):
     """Per-unit z-score parameters (mu, sd) computed over the full session.
 
@@ -431,7 +444,7 @@ def compute_unit_z(ephys, binary_signals, trial_events, bin_width, exclude_opto=
 
     Change the normalisation here to adjust z-scoring across all plotting functions."""
     ephys = get_trial_ephys(ephys, binary_signals, trial_events, exclude_opto)
-    ref_fr = ephys.count(bin_size=bin_width).values * bin_width
+    ref_fr = ephys.count(bin_size=bin_width).values / bin_width
     mu = ref_fr.mean(axis=0)
     sd = ref_fr.std(axis=0)
     sd = np.where(sd < 1e-6, 1.0, sd)
@@ -473,11 +486,7 @@ def plot_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bi
         if not event_list:
             return mat
         for ui, u in enumerate(all_units):
-            spk = np.asarray(ephys[u].index)
-            rows = np.zeros((len(event_list), n_bins))
-            for ti, t in enumerate(event_list):
-                h, _ = np.histogram(spk - t, bins=bin_edges)
-                rows[ti] = h * bin_width
+            rows = event_counts(ephys[u].index, event_list, bin_edges) / bin_width
             mat[ui] = rows.mean(axis=0)
         return mat
 
@@ -640,7 +649,7 @@ def plot_cue_aligned_by_latency(ephys, binary_signals, trial_events,
 
     # restrict spikes to trial windows and bin once for all trials
     all_ep = nap.IntervalSet(start=all_cue_times + t_start, end=all_cue_times + t_end)
-    binned_all = ephys.restrict(all_ep).count(bin_size=bin_width)*bin_width
+    binned_all = ephys.restrict(all_ep).count(bin_size=bin_width) / bin_width
 
     # extract per-trial firing-rate arrays: (n_trials, n_bins, n_units)
     trial_fr_list = []
@@ -795,11 +804,7 @@ def plot_outcome_heatmap_nostim(ephys, binary_signals, trial_events, save_path=N
     psth_ns = np.zeros((n_all, n_bins))
     if ns_events:
         for ui, u in enumerate(all_units):
-            spk = np.asarray(ephys[u].index)
-            rows = np.zeros((len(ns_events), n_bins))
-            for ti, t in enumerate(ns_events):
-                h, _ = np.histogram(spk - t, bins=bin_edges)
-                rows[ti] = h * bin_width
+            rows = event_counts(ephys[u].index, ns_events, bin_edges) / bin_width
             psth_ns[ui] = rows.mean(axis=0)
 
     if zscore:
@@ -932,16 +937,9 @@ def plot_cue_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None
     psth_out = np.zeros((n_all, n_out_bins))
     if pairs:
         for ui, u in enumerate(all_units):
-            spk = np.asarray(ephys[u].index)
-            rows_c = np.zeros((len(pairs), n_cue_bins))
-            rows_o = np.zeros((len(pairs), n_out_bins))
-            for ti in range(len(pairs)):
-                h, _ = np.histogram(spk - cue_times[ti], bins=cue_edges)
-                rows_c[ti] = h * bin_width
-                h, _ = np.histogram(spk - outcome_times[ti], bins=out_edges)
-                rows_o[ti] = h * bin_width
-            psth_cue[ui] = rows_c.mean(axis=0)
-            psth_out[ui] = rows_o.mean(axis=0)
+            spk = ephys[u].index
+            psth_cue[ui] = (event_counts(spk, cue_times[:len(pairs)], cue_edges) / bin_width).mean(axis=0)
+            psth_out[ui] = (event_counts(spk, outcome_times[:len(pairs)], out_edges) / bin_width).mean(axis=0)
 
     if zscore:
         psth_cue = (psth_cue - z_mu[:, None]) / z_sd[:, None]
@@ -1094,7 +1092,7 @@ def plot_cue_aligned_nostim(ephys, binary_signals, trial_events,
         return fig, None
 
     all_ep = nap.IntervalSet(start=cue_times + t_start, end=cue_times + t_end)
-    binned_all = ephys.restrict(all_ep).count(bin_size=bin_width) * bin_width
+    binned_all = ephys.restrict(all_ep).count(bin_size=bin_width) / bin_width
 
     trial_fr_list = []
     for s, e in zip(all_ep.start, all_ep.end):
@@ -1238,7 +1236,7 @@ def plot_spn_cue_aligned_nostim(ephys, binary_signals, trial_events,
         return fig
 
     all_ep = nap.IntervalSet(start=cue_times + t_start, end=cue_times + t_end)
-    binned_all = ephys.restrict(all_ep).count(bin_size=bin_width) * bin_width
+    binned_all = ephys.restrict(all_ep).count(bin_size=bin_width) / bin_width
 
     trial_fr_list = []
     for s, e in zip(all_ep.start, all_ep.end):
@@ -1424,14 +1422,10 @@ def plot_spn_mean_psth(ephys, binary_signals, trial_events,
     trial_fr_cue = np.zeros((n_total, n_cue_bins, n_units))
     trial_fr_out = np.zeros((n_total, n_out_bins, n_units))
 
-    for ti in range(n_total):
-        spikes = {u: np.asarray(ephys[u].index) for u in all_units}
-        for ui, u in enumerate(all_units):
-            spk = spikes[u]
-            h, _ = np.histogram(spk - cue_times[ti],     bins=cue_edges)
-            trial_fr_cue[ti, :, ui] = h * bin_width
-            h, _ = np.histogram(spk - outcome_times[ti], bins=out_edges)
-            trial_fr_out[ti, :, ui] = h * bin_width
+    for ui, u in enumerate(all_units):
+        spk = ephys[u].index
+        trial_fr_cue[:, :, ui] = event_counts(spk, cue_times[:n_total], cue_edges) / bin_width
+        trial_fr_out[:, :, ui] = event_counts(spk, outcome_times[:n_total], out_edges) / bin_width
 
     if zscore:
         z_mu, z_sd = compute_unit_z(ephys, binary_signals, trial_events, bin_width)
@@ -1610,13 +1604,10 @@ def plot_spn_rew_unrew_psth(ephys, binary_signals, trial_events,
 
     trial_fr_cue = np.zeros((n_total, n_cue_bins, n_units))
     trial_fr_out = np.zeros((n_total, n_out_bins, n_units))
-    for ti in range(n_total):
-        for ui, u in enumerate(all_units):
-            spk = np.asarray(ephys[u].index)
-            h, _ = np.histogram(spk - cue_times[ti],     bins=cue_edges)
-            trial_fr_cue[ti, :, ui] = h * bin_width
-            h, _ = np.histogram(spk - outcome_times[ti], bins=out_edges)
-            trial_fr_out[ti, :, ui] = h * bin_width
+    for ui, u in enumerate(all_units):
+        spk = ephys[u].index
+        trial_fr_cue[:, :, ui] = event_counts(spk, cue_times[:n_total], cue_edges) / bin_width
+        trial_fr_out[:, :, ui] = event_counts(spk, outcome_times[:n_total], out_edges) / bin_width
 
     if zscore:
         z_mu, z_sd = compute_unit_z(ephys, binary_signals, trial_events, bin_width)
@@ -1814,11 +1805,8 @@ def plot_spn_summary(ephys, binary_signals, trial_events,
     def _hist(ref_times, edges, n_bins):
         n = len(ref_times)
         fr = np.zeros((n, n_bins, n_units))
-        for ti, t in enumerate(ref_times):
-            for ui, u in enumerate(all_units):
-                spk = np.asarray(ephys[u].index)
-                h, _ = np.histogram(spk - t, bins=edges)
-                fr[ti, :, ui] = h * bin_width
+        for ui, u in enumerate(all_units):
+            fr[:, :, ui] = event_counts(ephys[u].index, ref_times, edges) / bin_width
         if zscore:
             fr = (fr - z_mu[np.newaxis, np.newaxis, :]) / z_sd[np.newaxis, np.newaxis, :]
         return fr
@@ -2040,7 +2028,7 @@ def plot_dspn_isPN_diff(ephys, binary_signals, trial_events,
 
     def _bin_trials(times):
         ep = nap.IntervalSet(start=times + t_start_outcome, end=times + t_end_outcome)
-        binned = ephys.restrict(ep).count(bin_size=bin_width) * bin_width
+        binned = ephys.restrict(ep).count(bin_size=bin_width) / bin_width
         fr_list = []
         for s, e in zip(ep.start, ep.end):
             td = binned.restrict(nap.IntervalSet(start=s, end=e))
@@ -2184,7 +2172,7 @@ def plot_dspn_isPN_diff(ephys, binary_signals, trial_events,
     all_cue_lats  = all_cue_lats[sort_order]
 
     cue_ep = nap.IntervalSet(start=all_cue_times + t_start, end=all_cue_times + t_end)
-    cue_binned = ephys.restrict(cue_ep).count(bin_size=bin_width) * bin_width
+    cue_binned = ephys.restrict(cue_ep).count(bin_size=bin_width) / bin_width
     cue_fr_list = []
     for s, e in zip(cue_ep.start, cue_ep.end):
         td = cue_binned.restrict(nap.IntervalSet(start=s, end=e))
@@ -2539,7 +2527,7 @@ def plot_dspn_isPN_bar(ephys, binary_signals, trial_events,
         """Mean z-scored dSPN − iSPN activity in pre_window relative to ref_t."""
         t0, t1 = ref_t + pre_window[0], ref_t + pre_window[1]
         ep = nap.IntervalSet(start=t0, end=t1)
-        binned = ephys.restrict(ep).count(bin_size=bin_width) * bin_width
+        binned = ephys.restrict(ep).count(bin_size=bin_width) / bin_width
         if len(binned.values) == 0:
             return np.nan
         z_val = (binned.values.mean(axis=0) - z_mu) / z_sd
@@ -2678,7 +2666,7 @@ def plot_dspn_ispn_lick_bout_bar(ephys, binary_signals, trial_events,
     def _zscore_diff(ref_t, window):
         t0, t1 = ref_t + window[0], ref_t + window[1]
         ep     = nap.IntervalSet(start=t0, end=t1)
-        binned = ephys.restrict(ep).count(bin_size=bin_width) * bin_width
+        binned = ephys.restrict(ep).count(bin_size=bin_width) / bin_width
         if len(binned.values) == 0:
             return np.nan
         z_val = (binned.values.mean(axis=0) - z_mu) / z_sd
@@ -2842,11 +2830,8 @@ def plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, save_path=None,
         z_mu, z_sd = compute_unit_z(ephys, binary_signals, trial_events, bin_width)
 
     fr = np.zeros((n_bouts, n_bins, n_units))
-    for ti, bt in enumerate(bout_times):
-        for ui, u in enumerate(all_units):
-            spk = np.asarray(ephys[u].index)
-            h, _ = np.histogram(spk - bt, bins=bin_edges)
-            fr[ti, :, ui] = h * bin_width
+    for ui, u in enumerate(all_units):
+        fr[:, :, ui] = event_counts(ephys[u].index, bout_times, bin_edges) / bin_width
     if zscore:
         fr = (fr - z_mu[np.newaxis, np.newaxis, :]) / z_sd[np.newaxis, np.newaxis, :]
 

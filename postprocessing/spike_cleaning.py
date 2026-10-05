@@ -61,7 +61,16 @@ R_MS = 1.5
 # automatic merges, in order; each is one compute_merge_unit_groups preset, except
 # REDUNDANT: the sorter's duplicate units (see auto_merge)
 REDUNDANT = 'redundant'
-MERGE_PRESETS = ('feature_neighbors', 'similarity_correlograms', REDUNDANT)
+DRIFT = 'drift'
+MERGE_PRESETS = ('feature_neighbors', 'similarity_correlograms', DRIFT, REDUNDANT)
+# DRIFT: one neuron the sorter (or a split) left as two units because drift changed its
+# waveform, so their templates miss MERGE_MIN_SIMILARITY. Neighbours within
+# DRIFT_MAX_DISTANCE_UM whose trains are mutually refractory (sos.mutually_refractory) and
+# whose templates still share DRIFT_MIN_SIMILARITY: the pieces of DS2_20260505 KS 605 sit
+# 6 um apart at cosine 0.85-0.89. The similarity floor keeps out pairs that are
+# refractory to each other but look nothing alike (DS48_20260922 905/913, cosine -0.39).
+DRIFT_MAX_DISTANCE_UM = 40.0
+DRIFT_MIN_SIMILARITY = 0.5
 # spikeinterface.curation.find_redundant_units: a pair is redundant when more than
 # duplicate_threshold of one unit's spikes fall within delta_time (ms) of the other's
 # (Kilosort4 emits such pairs, some offset by a fixed few samples -- a time-shifted copy of
@@ -81,6 +90,28 @@ MERGE_MIN_SIMILARITY = 0.9
 RP_MAX_CONTAMINATION, RP_CONFIDENCE, RP_MAX_FREE_VIOLATIONS = 0.10, 0.95, 3
 # a split half that is itself two clusters is split again, to this many levels
 SPLIT_MAX_DEPTH = 2
+
+
+# bombcell noise criteria left out. peak_to_trough_duration is measured from the trough to the
+# "peak after" it, and when a waveform has no distinct after-peak (a slow repolarisation, as in
+# many striatal units) SpikeInterface falls back to the highest point anywhere in the tail --
+# a few-uV wobble ~1.4 ms out -- so well-isolated units fail its 1.15 ms limit (DS2_20260505
+# KS 542: after-peak 2.2 uV at 1.40 ms; KS 548: 7.9 uV at 1.43 ms). It was the only failed
+# criterion of ~950 dropped "noise" units over 17 sessions (user decision, 2026-10-02)
+NOISE_EXCLUDED_METRICS = ('peak_to_trough_duration',)
+# SNR minimum lowered from bombcell's 5: the noise level SNR divides by is quantised (3.03 uV/bit,
+# a 3-5 bit wide background, so the MAD takes values 4.5 / 9.0 / 13.5 uV), and units failing only
+# SNR in [4, 5) looked well isolated on review (DS2, user decision, 2026-10-02)
+MUA_SNR_MIN = 4
+
+
+def default_thresholds():
+    """bombcell's default thresholds without the excluded noise criteria, with the SNR minimum lowered."""
+    th = copy.deepcopy(sic.bombcell_get_default_thresholds())
+    for m in NOISE_EXCLUDED_METRICS:
+        th['noise'].pop(m, None)
+    th['mua']['snr']['greater'] = MUA_SNR_MIN
+    return th
 
 
 def rp_metric_params(w_ms=W_MS, r_ms=R_MS):
@@ -456,7 +487,7 @@ def label_table(analyzer, labels, ks_names, thresholds=None, previous_labels=Non
     their thresholds; bombcell combines these (not every one alone makes a unit
     non-somatic), so read it as the evidence, not the rule.
     """
-    th = thresholds or sic.bombcell_get_default_thresholds()
+    th = thresholds or default_thresholds()
     metrics = analyzer.get_metrics_extension_data()
     mua_wo_rp = {k: v for k, v in th['mua'].items() if k != 'rp_contamination'}
 
@@ -517,7 +548,7 @@ def _noise_units(analyzer, thresholds=None, names=None):
     no spike-level cleaning changes. Returns a table: unit_id, name, n_spikes,
     firing_rate, failed.
     """
-    th = copy.deepcopy(thresholds or sic.bombcell_get_default_thresholds())
+    th = copy.deepcopy(thresholds or default_thresholds())
     labels = sic.bombcell_label_units(analyzer, thresholds=th, label_non_somatic=True,
                                       split_non_somatic_good_mua=True)
     noise = labels.index[labels['bombcell_label'] == 'noise'].tolist()
@@ -550,8 +581,6 @@ def rp_contamination_lower_bound(analyzer, confidence=RP_CONFIDENCE):
     through the same Llobet formula, which rises with the count, with the censored and
     refractory periods the quality_metrics extension was computed with.
     """
-    from scipy.stats import chi2
-    from spikeinterface.metrics.quality.misc_metrics import _compute_rp_contamination_one_unit
     qm = analyzer.get_extension('quality_metrics')
     p = qm.params['metric_params']['rp_violation']
     fs = analyzer.sampling_frequency
@@ -559,11 +588,31 @@ def rp_contamination_lower_bound(analyzer, confidence=RP_CONFIDENCE):
     t_r = int(round(p['refractory_period_ms'] * fs * 1e-3))
     n = analyzer.get_total_samples()
     data = qm.get_data()
-    lo = {}
-    for u, nv, ns in zip(data.index, data['rp_violations'], data['num_spikes']):
-        nv_lo = chi2.ppf(1 - confidence, 2 * nv) / 2 if nv > 0 else 0.0
-        lo[u] = _compute_rp_contamination_one_unit(nv_lo, ns, n, t_c, t_r) if ns > 0 else np.nan
-    return pd.Series(lo)
+    return pd.Series({u: _rp_lower_bound(nv, ns, n, t_c, t_r, confidence)
+                      for u, nv, ns in zip(data.index, data['rp_violations'], data['num_spikes'])})
+
+
+def _rp_lower_bound(n_v, n_spikes, n_samples, t_c, t_r, confidence=RP_CONFIDENCE):
+    """Lower confidence bound of the Llobet contamination for n_v violations (exact Poisson)."""
+    from scipy.stats import chi2
+    from spikeinterface.metrics.quality.misc_metrics import _compute_rp_contamination_one_unit
+    if n_spikes <= 0:
+        return np.nan
+    nv_lo = chi2.ppf(1 - confidence, 2 * n_v) / 2 if n_v > 0 else 0.0
+    return _compute_rp_contamination_one_unit(nv_lo, n_spikes, n_samples, t_c, t_r)
+
+
+def _rp_fails(train, n_samples, t_c, t_r):
+    """(fails the labels' refractory rule, violations, lower bound) for one sorted train.
+
+    Violations are pairs in (t_c, t_r]: closer pairs are the same spike twice, which the
+    pair passes resolve before the labels are made."""
+    train = np.sort(train)
+    idx = np.arange(train.size)
+    n_v = int(np.sum(np.searchsorted(train, train + t_r, 'right') - idx - 1)
+              - np.sum(np.searchsorted(train, train + t_c, 'right') - idx - 1))
+    lo = _rp_lower_bound(n_v, train.size, n_samples, t_c, t_r)
+    return bool(lo > RP_MAX_CONTAMINATION and n_v > RP_MAX_FREE_VIOLATIONS), n_v, lo
 
 
 def _bombcell_with_rp_minimum(analyzer, thresholds=None):
@@ -577,7 +626,7 @@ def _bombcell_with_rp_minimum(analyzer, thresholds=None):
     rp_violations, rp_contamination, rp_contamination_lo, rp_counted (bound over the
     limit) and rp_demoted for the audit.
     """
-    th = copy.deepcopy(thresholds or sic.bombcell_get_default_thresholds())
+    th = copy.deepcopy(thresholds or default_thresholds())
     th.get('mua', {}).pop('rp_contamination', None)
     labels = sic.bombcell_label_units(analyzer, thresholds=th, label_non_somatic=True,
                                       split_non_somatic_good_mua=True)
@@ -650,6 +699,72 @@ def _strict_merge_veto(analyzer, group, w_ms, r_ms, max_shift=0, max_cross=0):
     return ''
 
 
+def _merged_rp_veto(analyzer, group, w_ms=W_MS, r_ms=R_MS):
+    """'' if the group's pooled train passes the labels' refractory rule, else why not.
+
+    Being refractory *to each other* says nothing about each member's own contamination:
+    on DS2_20260505 good units 250 and 311 were refractory to their MUA neighbours 248
+    (26 violations) and 308 (136), and merging made both MUA."""
+    fs = analyzer.sampling_frequency
+    trains = _unit_samples(analyzer)
+    pooled = np.concatenate([trains[u] for u in group])
+    fails, n_v, lo = _rp_fails(pooled, analyzer.get_total_samples(), _t_c(fs, w_ms), _t_c(fs, r_ms))
+    if fails:
+        return (f'merged {"+".join(map(str, group))} not refractory: {n_v} violations, '
+                f'contamination lower bound {lo:.2f}')
+    return ''
+
+
+def _drift_pair_test(analyzer, trains_s, a, b):
+    """(is a drift pair, note) for two units: mutually refractory, still alike, and
+    refractory as one unit."""
+    obs, exp = sos.coincidences(trains_s[a], trains_s[b])
+    s = _template_cosine(analyzer, a, b)
+    if s < DRIFT_MIN_SIMILARITY:
+        return False, f'template similarity {a}-{b} {s:.2f} < {DRIFT_MIN_SIMILARITY:g}'
+    if not sos.mutually_refractory(obs, exp):
+        return False, f'{a}-{b}: {obs} of {exp:.1f} expected coincidences: not mutually refractory'
+    why = _merged_rp_veto(analyzer, [a, b])
+    if why:
+        return False, why
+    return True, f'{a}-{b}: {obs} of {exp:.0f} expected coincidences, similarity {s:.2f}'
+
+
+def _drift_pairs(analyzer):
+    """Candidate drift pairs: neighbours that pass _drift_pair_test."""
+    fs = analyzer.sampling_frequency
+    ids = list(analyzer.unit_ids)
+    loc = analyzer.get_extension('unit_locations').get_data()[:, :2]
+    trains_s = {u: s / fs for u, s in _unit_samples(analyzer).items()}
+    pairs = []
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            if np.linalg.norm(loc[i] - loc[j]) <= DRIFT_MAX_DISTANCE_UM:
+                if _drift_pair_test(analyzer, trains_s, ids[i], ids[j])[0]:
+                    pairs.append((ids[i], ids[j]))
+    return pairs, trains_s
+
+
+def _drift_merge_veto(analyzer, group, trains_s):
+    """Why a drift group fails, or ''. Every pair must look alike; a pair active together
+    long enough to test must be mutually refractory, and one that is not (pieces from
+    either end of a drift, joined through a middle one) may have no more cross-unit
+    coincidences than the refractory floor of the labels."""
+    for i in range(len(group)):
+        for j in range(i + 1, len(group)):
+            a, b = group[i], group[j]
+            s = _template_cosine(analyzer, a, b)
+            if s < DRIFT_MIN_SIMILARITY:
+                return f'template similarity {a}-{b} {s:.2f} < {DRIFT_MIN_SIMILARITY:g}'
+            obs, exp = sos.coincidences(trains_s[a], trains_s[b])
+            if exp >= sos.MUTUAL_MIN_EXPECTED:
+                if not sos.mutually_refractory(obs, exp):
+                    return f'{a}-{b}: {obs} of {exp:.1f} expected coincidences'
+            elif obs > RP_MAX_FREE_VIOLATIONS:
+                return f'{a}-{b}: {obs} coincidences within {sos.REFRACTORY_MS:g} ms'
+    return _merged_rp_veto(analyzer, group)
+
+
 def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, **job_kwargs):
     """Soft merges, one preset at a time. Returns (analyzer, merge table).
 
@@ -666,7 +781,10 @@ def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, **job_kwar
     balance = _default_step_params['quality_score']['firing_contamination_balance']
     for preset in presets:
         max_shift = 0
-        if preset == REDUNDANT:
+        trains_s = None
+        if preset == DRIFT:
+            pairs, trains_s = _drift_pairs(analyzer)
+        elif preset == REDUNDANT:
             # the sorter's duplicates: units sharing most of their spikes. The presets miss
             # them -- their cross-correlogram peaks at 0 lag where a split unit's dips -- and
             # the pair passes only resolve pairs within a unit, so both copies survive.
@@ -703,7 +821,8 @@ def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, **job_kwar
         # (a resolved group joins units that were only proposed through a third)
         strict = []
         for g in groups:
-            why = _strict_merge_veto(analyzer, list(g), w_ms, r_ms, max_shift, max_cross)
+            why = (_drift_merge_veto(analyzer, list(g), trains_s) if preset == DRIFT else
+                   _strict_merge_veto(analyzer, list(g), w_ms, r_ms, max_shift, max_cross))
             if why:
                 rows.append({'preset': preset, 'group': '+'.join(map(str, g)), 'members': list(g),
                              'new_unit_id': None, 'merged': False, 'reference': None,

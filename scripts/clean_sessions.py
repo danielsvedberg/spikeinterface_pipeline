@@ -52,17 +52,24 @@ def clean_session(base_folder, job_kwargs):
     folders = fs.SessionPaths(base_folder)
     clean_path = folders.sorting_path('analyzer_clean')
     prev_path = folders.sorting_path('analyzer_clean_prev')
-    if clean_path.exists() and prev_path.exists():
-        raise RuntimeError(f'{prev_path} already exists; not overwriting it -- move one of '
-                           'analyzer_clean / analyzer_clean_prev out of the way first')
+    # a session cleaned before (analyzer_clean_prev = the original curation, analyzer_clean = an
+    # earlier cleaning) is re-cleaned with both kept: the earlier cleaning is moved to
+    # analyzer_clean_superseded once its replacement is in hand
+    superseded = folders.sorting_path('analyzer_clean_superseded')
+    reclean = clean_path.exists() and prev_path.exists()
+    if reclean and superseded.exists():
+        raise RuntimeError(f'{superseded} already exists; not overwriting it -- delete it (an '
+                           'earlier re-clean) or move it out of the way first')
     audit = folders.sorting_path('spike_cleaning')
     analyzer = load_analyzer(folders, 'analyzer')
-    # the old curation's labels, for the before/after columns of unit_labels.csv
+    # the original curation's labels, for the before/after columns of unit_labels.csv
     previous = None
-    if clean_path.exists():
-        old = si.load_sorting_analyzer(clean_path, load_extensions=False)
+    old_path = prev_path if prev_path.exists() else clean_path
+    if old_path.exists():
+        old = si.load_sorting_analyzer(old_path, load_extensions=False)
         if old.sorting.get_property('bombcell_label') is not None:
             previous = dict(zip(old.unit_ids, old.sorting.get_property('bombcell_label')))
+        old = None
     stim = gsf.get_stimulation_intervals(base_folder)
     print(f'{base_folder.name}: {len(analyzer.unit_ids)} units, '
           f'{analyzer.sorting.to_spike_vector().size} spikes, {len(stim)} stimulation pulses')
@@ -72,7 +79,7 @@ def clean_session(base_folder, job_kwargs):
                                             **job_kwargs)
     # the old clean analyzer is moved aside only now, with its replacement in hand
     if clean_path.exists():
-        clean_path.rename(prev_path)
+        clean_path.rename(superseded if reclean else prev_path)
     clean.save_as(folder=clean_path, format='binary_folder')
     return report
 
@@ -191,7 +198,9 @@ def write_label_table(base_folder, labels=None):
     previous = None
     if prev_path.exists():
         old = si.load_sorting_analyzer(prev_path, load_extensions=False)
-        previous = dict(zip(old.unit_ids, old.sorting.get_property('bombcell_label')))
+        old_labels = old.sorting.get_property('bombcell_label')
+        if old_labels is not None:  # a previous curation saved without labels has nothing to compare
+            previous = dict(zip(old.unit_ids, old_labels))
     raw = si.load_sorting_analyzer(folders.sorting_path('analyzer'), load_extensions=False)
     kl = raw.sorting.get_property('KSLabel')
     noise_path = audit / 'noise_units_dropped.csv'
@@ -263,7 +272,7 @@ def fill_rp_review(base_folder, clean=None):
     audit = folders.sorting_path('spike_cleaning')
     out = folders.sorting_path('sorting_summary_clean')
     clean = clean or si.load_sorting_analyzer(folders.sorting_path('analyzer_clean'))
-    th = sic.bombcell_get_default_thresholds()
+    th = scl.default_thresholds()
     metrics = clean.get_metrics_extension_data()
     others = {k: v for k, v in th['mua'].items() if k != 'rp_contamination'}
     ids = pd.read_csv(audit / 'unit_ids.csv').set_index('unit_id')

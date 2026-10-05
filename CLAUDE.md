@@ -31,8 +31,9 @@ Intan — see `preprocessing/intan_vs_nidq.md`).
 ## Data layout (`utils/file_structure.py`, `SessionPaths`)
 
 `<root>/{recording_files,sorting_files,analysis_files}/<animal>/<session>/`, e.g.
-`DS15/DS15_20260702`. Roots: `C:\Users\assad\Desktop\experiment_data` (DS48, current) and
-`D:\experiment_data` (DS15, DS45, DS2, archive). C: is nearly full — keep big outputs on D:.
+`DS15/DS15_20260702`. Root: `D:\experiment_data` holds every dataset (DS48 was moved there
+from `C:\Users\assad\Desktop\experiment_data` on 2026-10-02; C: keeps only a copy of
+`analysis_files/DS48`, which is no longer updated). Keep big outputs on D:.
 - recording_files: SpikeGLX `*_g0` (nidq + imec), `nidaq_map.txt` (dinmap/ainmap/optoidx),
   behaviour `.mat`, `<session>_eventTable.csv` (Arduino event log, ms), `preprocess/`
   (filtered recording the sort was run on), `saturation/` (raw saturation scan cache).

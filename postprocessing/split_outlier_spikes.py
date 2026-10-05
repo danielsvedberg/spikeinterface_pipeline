@@ -191,6 +191,35 @@ SPLIT_MIN_SPIKES, SPLIT_MIN_SHARE = 100, 0.03
 SPLIT_MIN_OVERLAP = 0.3
 SPLIT_BIN_S = 60.0
 SPLIT_MAX_FIT = 20000
+# two pieces of one neuron cannot fire within its refractory period of each other: of the
+# coincidences within +-REFRACTORY_MS that two independent trains would have (from their
+# rates in each SPLIT_BIN_S bin, so a drift handover is judged where both are active), they
+# show at most MUTUAL_MAX_RATIO, out of at least MUTUAL_MIN_EXPECTED. Neighbouring
+# different neurons sit near 1 (5th percentile 0.74 over 24k pairs within 40 um, all
+# sessions); the sorter's missed overlaps leave close high-rate pairs at ~0.25-0.3.
+# DS2_20260505 KS 605, drifting 12 um in two steps, was split at both: its pieces show 3
+# of 46 expected.
+MUTUAL_MAX_RATIO, MUTUAL_MIN_EXPECTED = 0.1, 20.0
+
+
+def coincidences(ta, tb, r_s=REFRACTORY_MS / 1000.0, bin_s=SPLIT_BIN_S):
+    """(observed, expected) pairs of a spike of each train within |lag| <= r_s.
+
+    ta, tb : sorted spike times (s). Expected: what independent trains with the same rate
+    in every bin_s bin would have, sum over bins of n_a * n_b * 2 r_s / bin_s.
+    """
+    ta, tb = np.asarray(ta, float), np.asarray(tb, float)
+    if not ta.size or not tb.size:
+        return 0, 0.0
+    obs = int((np.searchsorted(tb, ta + r_s, 'right') - np.searchsorted(tb, ta - r_s, 'left')).sum())
+    edges = np.arange(0.0, max(ta[-1], tb[-1]) + bin_s, bin_s)
+    exp = float((np.histogram(ta, edges)[0] * np.histogram(tb, edges)[0]).sum() * 2 * r_s / bin_s)
+    return obs, exp
+
+
+def mutually_refractory(obs, exp):
+    """True when the deficit of coincidences says one neuron (see MUTUAL_MAX_RATIO)."""
+    return exp >= MUTUAL_MIN_EXPECTED and obs <= MUTUAL_MAX_RATIO * exp
 
 
 def _bimodal_split(X, t, bad, seed=0):
@@ -205,7 +234,7 @@ def _bimodal_split(X, t, bad, seed=0):
     from sklearn.mixture import GaussianMixture
     good = ~bad
     stats = {'split_D': np.nan, 'split_valley': np.nan, 'split_sizes': '', 'split_overlap': np.nan,
-             'split_reason': ''}
+             'split_coinc_obs': np.nan, 'split_coinc_exp': np.nan, 'split_reason': ''}
     n = int(good.sum())
     min_n = max(SPLIT_MIN_SPIKES, SPLIT_MIN_SHARE * n)
     if n < 2 * min_n:
@@ -255,6 +284,14 @@ def _bimodal_split(X, t, bad, seed=0):
         return None, stats
     if overlap < SPLIT_MIN_OVERLAP:
         stats['split_reason'] = f'REVIEW: clusters take turns in time (overlap {overlap:.2f}); drift?'
+        return None, stats
+    # clusters that never fire within a refractory period of each other are one neuron,
+    # its waveform changed by drift (or another slow change) -- not two neurons
+    obs, exp = coincidences(tg[lab == 0], tg[lab == 1])
+    stats['split_coinc_obs'], stats['split_coinc_exp'] = obs, exp
+    if mutually_refractory(obs, exp):
+        stats['split_reason'] = (f'one neuron: clusters mutually refractory ({obs} of {exp:.0f} '
+                                 f'expected coincidences within {REFRACTORY_MS:g} ms)')
         return None, stats
     stats['split_reason'] = 'split'
     labels = np.zeros(X.shape[0], dtype=np.int8)

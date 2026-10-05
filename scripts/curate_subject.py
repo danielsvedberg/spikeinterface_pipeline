@@ -95,10 +95,13 @@ def pynapple_analysis(base):
         # no longer exist would linger among the new ones -- clear them, they are regenerated
         for name in OLD_PYNAPPLE + ('stim_firing_plots',):
             q = pyn / name
-            if q.is_dir():
-                shutil.rmtree(q)
-            elif q.exists():
-                q.unlink()
+            try:
+                if q.is_dir():
+                    shutil.rmtree(q)
+                elif q.exists():
+                    q.unlink()
+            except PermissionError as e:  # a csv left open in Excel; isolate writes a _new copy
+                print(f'  could not clear {q} ({e.strerror}); left in place', flush=True)
     clean = si.load_sorting_analyzer(folders.sorting_path('analyzer_clean'))
     to_pynapple_tsgroup(clean, attach_unit_metadata=True).save(pyn / 'spikes.npz')
     for step in (sp.plot_opto_psth, sp.plot_psth, sp.plot_time_to_first_spike, sp.plot_tuning_curves):
