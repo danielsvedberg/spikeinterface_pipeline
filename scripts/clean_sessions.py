@@ -34,6 +34,8 @@ sorted before the cleaning) are cleaned from that analyzer; the dedup had remove
 0.1-0.2% of their spikes.
 """
 import json
+import os
+import shutil
 import sys
 import time
 import traceback
@@ -48,20 +50,88 @@ from preprocessing import get_stimulation_frames as gsf
 from utils import file_structure as fs
 
 
+def _free_name(folders, stem):
+    """The first of <stem>, <stem>_2, <stem>_3, ... that does not exist yet."""
+    k = 1
+    while True:
+        path = folders.sorting_path(stem if k == 1 else f'{stem}_{k}')
+        if not path.exists():
+            return path
+        k += 1
+
+
+def _stage_recording(folders):
+    """The session's preprocessed recording, copied to $SI_STAGE_DIR (a fast disk) once.
+
+    The cleaning reads the whole recording once per peel round, and D: is one hard disk:
+    several sessions reading it at once thrash it (DS15, 2026-10-06: 180 MB/s, 0% idle, three
+    sessions stalled). Copies are made one at a time across processes (a lock file), into a
+    temporary name that is renamed when complete. Returns None without SI_STAGE_DIR.
+    """
+    stage = os.environ.get('SI_STAGE_DIR')
+    if not stage:
+        return None
+    src = Path(folders.preprocess_folder)
+    dst = Path(stage) / src.parent.name / src.name
+    if not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        lock = Path(stage) / '.copy.lock'
+        while True:
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                time.sleep(10)
+        try:
+            tmp = dst.with_name(dst.name + '_copying')
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            t0 = time.time()
+            shutil.copytree(src, tmp)
+            tmp.rename(dst)
+            print(f'{src.parent.name}: preprocessed recording staged to {dst} '
+                  f'in {(time.time() - t0) / 60:.1f} min', flush=True)
+        finally:
+            os.close(fd)
+            lock.unlink()
+    return dst
+
+
 def clean_session(base_folder, job_kwargs):
     folders = fs.SessionPaths(base_folder)
     clean_path = folders.sorting_path('analyzer_clean')
     prev_path = folders.sorting_path('analyzer_clean_prev')
     # a session cleaned before (analyzer_clean_prev = the original curation, analyzer_clean = an
-    # earlier cleaning) is re-cleaned with both kept: the earlier cleaning is moved to
-    # analyzer_clean_superseded once its replacement is in hand
-    superseded = folders.sorting_path('analyzer_clean_superseded')
+    # earlier cleaning) is re-cleaned with both kept: the earlier cleaning is moved to the first
+    # free analyzer_clean_superseded[_k] once its replacement is in hand
     reclean = clean_path.exists() and prev_path.exists()
-    if reclean and superseded.exists():
-        raise RuntimeError(f'{superseded} already exists; not overwriting it -- delete it (an '
-                           'earlier re-clean) or move it out of the way first')
+    superseded = _free_name(folders, 'analyzer_clean_superseded')
     audit = folders.sorting_path('spike_cleaning')
+    old_audit = folders.sorting_path('spike_cleaning' + superseded.name[len('analyzer_clean'):])
+    if reclean and audit.exists() and old_audit.exists() and not (audit / 'report.json').exists():
+        # an interrupted re-clean: the audit folder is its own, unfinished; start it afresh
+        # (the earlier cleaning's audit is already in old_audit)
+        for item in audit.iterdir():
+            if item.name != 'outlier_scores.pkl':
+                shutil.rmtree(item) if item.is_dir() else item.unlink()
+        print(f'{base_folder.name}: unfinished audit of an interrupted re-clean cleared')
+    elif reclean and audit.exists():
+        # the earlier cleaning's audit (tables, review figures) goes with it, under the same
+        # suffix; the outlier-score cache comes back, as it depends on the sort alone
+        audit.rename(old_audit)
+        audit.mkdir()
+        cache = old_audit / 'outlier_scores.pkl'
+        if cache.exists():
+            shutil.copy2(cache, audit / 'outlier_scores.pkl')
+        print(f'{base_folder.name}: earlier audit moved to {old_audit.name}')
     analyzer = load_analyzer(folders, 'analyzer')
+    staged = _stage_recording(folders)
+    original_rec = analyzer._recording
+    if staged is not None:
+        rec = si.load(staged)
+        analyzer.set_temporary_recording(rec)  # checks it is the same recording
+        # the copies that splits and selections make take _recording, not the temporary one
+        analyzer._recording, analyzer._temporary_recording = rec, None
     # the original curation's labels, for the before/after columns of unit_labels.csv
     previous = None
     old_path = prev_path if prev_path.exists() else clean_path
@@ -80,7 +150,17 @@ def clean_session(base_folder, job_kwargs):
     # the old clean analyzer is moved aside only now, with its replacement in hand
     if clean_path.exists():
         clean_path.rename(superseded if reclean else prev_path)
+    if staged is not None:
+        # saved pointing at the recording on D:, not at the staged copy
+        clean._recording = original_rec
     clean.save_as(folder=clean_path, format='binary_folder')
+    if staged is not None:
+        clean, analyzer = None, None
+        try:
+            shutil.rmtree(staged)
+            print(f'{base_folder.name}: staged recording removed', flush=True)
+        except OSError as e:  # still memory-mapped by a straggling worker
+            print(f'{base_folder.name}: could not remove {staged}: {e!r}', flush=True)
     return report
 
 
@@ -95,13 +175,15 @@ def relabel_session(base_folder):
     audit = folders.sorting_path('spike_cleaning')
     clean = si.load_sorting_analyzer(folders.sorting_path('analyzer_clean'))
     old = dict(zip(clean.unit_ids, clean.sorting.get_property('bombcell_label')))
-    labels = scl._bombcell_with_rp_minimum(clean)
+    # the refractory criterion on spontaneous spikes (spike_cleaning.RP_STIM_PAD_S)
+    labels = scl._bombcell_with_rp_minimum(
+        clean, stim_intervals=gsf.get_stimulation_intervals(base_folder))
     new = labels.loc[clean.unit_ids, 'bombcell_label'].values
     assert not (new == 'noise').any(), 'relabel turned a kept unit into noise'
     clean.set_sorting_property('bombcell_label', new)
     ids = pd.read_csv(audit / 'unit_ids.csv').set_index('unit_id')
     for col in ('bombcell_label', 'rp_violations', 'rp_contamination', 'rp_contamination_lo',
-                'rp_counted', 'rp_demoted'):
+                'rp_counted', 'rp_demoted', 'rp_violations_all', 'rp_spikes_counted'):
         ids.loc[list(clean.unit_ids), col] = labels.loc[clean.unit_ids, col].values
     ids.reset_index().to_csv(audit / 'unit_ids.csv', index=False)
     write_label_table(base_folder, labels=labels)
@@ -191,7 +273,8 @@ def write_label_table(base_folder, labels=None):
     kept = ids[ids['unit_id'].isin(clean.unit_ids)].set_index('unit_id')
     if labels is None:
         if 'rp_contamination_lo' not in kept.columns:  # saved before the confidence rule
-            labels = scl._bombcell_with_rp_minimum(clean)
+            labels = scl._bombcell_with_rp_minimum(
+                clean, stim_intervals=gsf.get_stimulation_intervals(base_folder))
         else:
             labels = kept[['bombcell_label', 'rp_violations', 'rp_contamination_lo', 'rp_counted']]
     prev_path = folders.sorting_path('analyzer_clean_prev')

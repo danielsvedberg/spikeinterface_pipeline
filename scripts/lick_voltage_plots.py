@@ -32,7 +32,7 @@ from preprocessing import get_stimulation_frames as gsf
 from preprocessing import preprocess_qc as pqc
 from utils import file_structure as fs
 
-DEFAULT_ANIMAL = Path(r'D:\experiment_data\recording_files\DS45')
+DEFAULT_ANIMAL = Path(r'C:\experiment_data\recording_files\DS45')
 
 
 class SessionSkipped(Exception):

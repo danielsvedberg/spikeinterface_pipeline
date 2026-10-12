@@ -31,9 +31,18 @@ Intan — see `preprocessing/intan_vs_nidq.md`).
 ## Data layout (`utils/file_structure.py`, `SessionPaths`)
 
 `<root>/{recording_files,sorting_files,analysis_files}/<animal>/<session>/`, e.g.
-`DS15/DS15_20260702`. Root: `D:\experiment_data` holds every dataset (DS48 was moved there
-from `C:\Users\assad\Desktop\experiment_data` on 2026-10-02; C: keeps only a copy of
-`analysis_files/DS48`, which is no longer updated). Keep big outputs on D:.
+`DS15/DS15_20260702`. Root: **`C:\experiment_data`** (since 2026-10-09). Its `sorting_files`
+and `analysis_files` are real folders on C: (NVMe SSD); its `recording_files` is a directory
+junction to `D:\experiment_data\recording_files` (raw data + preprocess on D:, a single SATA
+hard disk, ~180 MB/s). Always open sessions through `C:\experiment_data\...` so SessionPaths
+resolves the root to C:; a `D:\experiment_data\recording_files\...` path would resolve
+sorting/analysis to D:, which is empty now. Remove the junction only with `cmd /c rmdir`.
+Never run several recording-reading jobs on D: at once; stage a recording to C: when a job
+reads it repeatedly (`SI_STAGE_DIR`, see `clean_sessions._stage_recording`).
+DS15 / DS2 / DS45 / DS48 (17 sessions) hold only the latest sorts: Kilosort 4.1.7 "heavy"
+params, new-chain preprocessing, greedy cleaning; the older sorts and their products were
+deleted 2026-10-09 (issues.md 30/31). Other animals keep their original sorts.
+`C:\Users\assad\Desktop\experiment_data` is an old copy, not the root.
 - recording_files: SpikeGLX `*_g0` (nidq + imec), `nidaq_map.txt` (dinmap/ainmap/optoidx),
   behaviour `.mat`, `<session>_eventTable.csv` (Arduino event log, ms), `preprocess/`
   (filtered recording the sort was run on), `saturation/` (raw saturation scan cache).
@@ -65,16 +74,22 @@ analysis folder.
    is first in the chain (decided after ringing tests); saturation detection
    (`preprocessing/detect_saturation.py`), QC in `preprocessing/preprocess_qc.py`.
 3. **Sorting** — Kilosort4 via `si_pipeline.run_pipeline`.
-4. **Spike cleaning + curation** — `postprocessing/spike_cleaning.clean_and_curate` (replaced
-   `remove_duplicated_spikes`), in order: bimodal PCA splits (GMM, up to 2 levels;
-   `split_outlier_spikes`) -> drop bombcell-noise units (waveforms plotted for review) ->
-   outlier spikes (robust MCD on PCs + template-match scale + location, log-d2 z > 6,
-   stimulation outliers dropped too) -> resolve spike pairs <= 1 ms within a unit (worse
-   template match dropped) -> strict merges (presets + cosine >= 0.9 + no cross spikes in
-   (1, 1.5] ms) -> pairs again -> metrics with refractory windows censored at 1.0 ms, R = 1.5 ms
-   -> bombcell labels with the rp rule (MUA if the 95% lower bound of contamination > 10% and
-   > 3 violations). Audit tables (`unit_labels.csv`, `unit_ids.csv`, `removed_spikes.csv`,
-   `merges.csv`, ...) and review plots go to `sorting_files/.../spike_cleaning/`.
+4. **Spike cleaning + curation** � `postprocessing/spike_cleaning.clean_and_curate` (7 steps):
+   score every spike (`score_outliers`) -> greedy split + peel (`greedy_cleaning.greedy_split_and_peel`:
+   bimodal GMM splits and outlier peeling in one loop, re-split after every peel round; outliers go
+   to '/out' clusters, light-edge artifacts to '/art'; stimulation outliers dropped too) -> noise units
+   flagged and kept out of the merges -> resolve spike pairs <= 1 ms within a unit (worse template
+   match dropped; '/nan' clusters go) -> merges (`auto_merge`: strict presets, outlier-cluster
+   re-homing, drift handoffs) -> pairs again in merged units, '/art' and small '/out' clusters go ->
+   metrics with refractory windows censored at 1.0 ms, R = 1.5 ms -> bombcell labels with the rp
+   rule (MUA if the 95% lower bound of contamination > 10% and > 3 violations, on spontaneous spikes:
+   light pulses + 100 ms left out). Audit tables (`unit_labels.csv`, `unit_ids.csv`,
+   `removed_spikes.csv`, `merges.csv`, `outlier_audit.csv`, `pairs_*_merge.csv`, ...) and review
+   plots go to `sorting_files/.../spike_cleaning/`. Since 2026-10-12 (code; applied at the next
+   re-clean, issues.md 35): the PAIR_MERGE preset (`postprocessing/pair_merge.py`: one-neuron
+   evidence by cross-refractory dip or mixture clusters, merged only if presence rises >= 0.05 and
+   SNR stays >= 0.8x) and step 6b, double detections across units within 60 um deleted from one
+   side by template match; spatial-decay noise range 0.005-0.15; small outlier clusters kept by shape.
    - `scripts/clean_sessions.py`: cleaning from an existing analyzer; `--relabel` (re-apply
      labels to analyzer_clean), `--summary` (sorting summary + `rp_review/`).
 5. **Analysis** — pynapple export (`to_pynapple_tsgroup`) + `si_pipeline.plot_opto_psth`,
@@ -100,6 +115,9 @@ analysis folder.
 - Never call `run_pipeline` from tests or batch re-analysis of sorted sessions: its fallbacks
   can re-sort and delete a sort. Never modify an existing `analyzer`; a new curation is saved as
   `analyzer_clean` with the old one kept as `analyzer_clean_prev`.
+- **Never delete raw data**: nothing under an `<ANID>_g#` (SpikeGLX run) folder, above all the raw
+  `.bin` files — they are the originals. The only exception is a *copy*, once it is verified that
+  the original exists elsewhere (user, 2026-10-07).
 - Back up before overwriting any data product (copy to a temporary name, then rename). Check
   the target before deleting or overwriting.
 - Do not sort, re-preprocess, or start multi-hour runs without asking; say what a run will

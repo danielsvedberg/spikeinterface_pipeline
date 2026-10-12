@@ -217,7 +217,13 @@ def parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_sup
     mididx = len(tone_times) // 2
     tone_onsets = tone_times[:mididx]
     tone_offsets = tone_times[mididx:]
+    return _parse_tone_edges(tone_onsets, tone_offsets, solenoid_onsets, time_support,
+                             tonemap=tonemap, method=method)
 
+
+def _parse_tone_edges(tone_onsets, tone_offsets, solenoid_onsets, time_support, tonemap=None,
+                      method='auto'):
+    """The tones from a tone line's rising and falling edges (see parse_tones_digital's method)."""
     if method == 'auto':
         # a square wave has short cycles: most rising edges follow the last within 20 ms
         rises = np.sort(tone_onsets)
@@ -230,7 +236,9 @@ def parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_sup
 
 
 def parse_tones_analog(analog_events, solenoid_ts_list, nidq_t_aligned,
-                       idx={'tone':5}):
+                       idx={'tone':5}, tonemap=None, method='auto'):
+    """The task's tones from an analog tone channel, binarized; classified like the digital
+    line (older rigs, e.g. DS13, record the speaker's square wave on an analog input)."""
     time_support = nap.IntervalSet(start=nidq_t_aligned[0], end=nidq_t_aligned[-1])
     solenoid_onsets = solenoid_ts_list[0].t
 
@@ -238,11 +246,9 @@ def parse_tones_analog(analog_events, solenoid_ts_list, nidq_t_aligned,
     tone_trace = analog_events[:,tone_ch]
     tone_digital = binarize_trace(tone_trace)
     tone_onsets = get_edge_times(tone_digital, nidq_t_aligned, edge_type='rising')
-
-    #get the inter onset intervals
     tone_offsets = get_edge_times(tone_digital, nidq_t_aligned, edge_type='falling')
-
-    return parse_tones(tone_onsets, tone_offsets, solenoid_onsets, time_support)
+    return _parse_tone_edges(tone_onsets, tone_offsets, solenoid_onsets, time_support,
+                             tonemap=tonemap, method=method)
 
 def _near_any(times, targets, tol):
     """Boolean mask of the times that lie within tol of some target time."""
@@ -1523,7 +1529,8 @@ def get_binary_signals(base_folder=None, dinmap=None,ainmap=None, optoidx=None, 
         tones_ts_list, tones_ts_idx = parse_tones_digital(digital_events, solenoid_ts_list, map2imectime, time_support, idx=dinmap,
                                                           tonemap=get_tonemap(paths), method=tone_method)
     elif 'tone' in ainmap.keys():
-        tones_ts_list, tones_ts_idx = parse_tones_analog(analog_events, solenoid_ts_list, nidq_t_aligned, idx=ainmap)
+        tones_ts_list, tones_ts_idx = parse_tones_analog(analog_events, solenoid_ts_list, nidq_t_aligned, idx=ainmap,
+                                                         tonemap=get_tonemap(paths), method=tone_method)
     else:
         raise ValueError("Tone channel not found in either dinmap or ainmap.")
     ts_list += tones_ts_list

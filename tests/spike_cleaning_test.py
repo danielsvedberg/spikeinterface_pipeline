@@ -34,7 +34,7 @@ from postprocessing import spike_cleaning as scl
 from preprocessing import get_stimulation_frames as gsf
 from utils import file_structure as fs
 
-DEFAULT_FOLDER = Path(r"D:\experiment_data\recording_files\DS45\DS45_20260811")
+DEFAULT_FOLDER = Path(r"C:\experiment_data\recording_files\DS45\DS45_20260811")
 HAND_CHECKED = [28, 27, 19, 320, 271]
 # two separate clusters in one unit (a waveform and noise crossings): must be split
 BIMODAL_UNIT = 146

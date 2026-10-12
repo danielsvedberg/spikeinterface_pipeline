@@ -21,7 +21,7 @@ from analysis import plot_psth as pp
 from utils import file_structure as fs
 
 def test():
-    base_folder = Path(r"D:\experiment_data\recording_files\DS45\DS45_20260811")
+    base_folder = Path(r"C:\experiment_data\recording_files\DS45\DS45_20260811")
     nidaq_map=None
     bad_chans=None
     export_raw_summary=True

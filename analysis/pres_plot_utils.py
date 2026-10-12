@@ -15,6 +15,20 @@ def _make_dark_cmap(name, darken=0.95):
 _jet_dark   = _make_dark_cmap('jet')
 _turbo_dark = _make_dark_cmap('turbo')
 
+# bin width (s) of every binned rate in the compendium / ratio_tests analyses -- the PSTHs,
+# heatmaps and the z-score reference they share (compute_unit_z). 100 ms since 2026-10-05
+# (user); was 50 ms.
+BIN_WIDTH = 0.1
+
+# unit classes the compendium / ratio_tests plots break units down by (final_classif from
+# isolate_single_tagged_units): opsin-tagged SPNs, and the light-driven units too fast at rest
+# to be SPNs (bU / oU / mU: blue / orange / multi; TAGGED_MAX_BASELINE_HZ there). Units with
+# none of these are the untagged / Unlabeled rest. The dSPN-iSPN difference plots stay dSPN vs iSPN.
+TAGGED_CLASSES = ('dSPN', 'iSPN', 'muSPN', 'bU', 'oU', 'mU')
+CLASS_COLORS = {'dSPN': 'tab:blue', 'iSPN': 'tab:orange', 'muSPN': 'tab:purple',
+                'bU': 'tab:cyan', 'oU': 'goldenrod', 'mU': 'orchid',
+                'dSPN-iSPN': 'black', 'Unlabeled': '0.5', 'untagged': '0.6'}
+
 plt.rcParams.update({
     'font.size':        8,
     'axes.titlesize':   8,
@@ -333,6 +347,10 @@ def merge_sessions(sessions, session_gap=86400.0):
             row = emeta.loc[orig_id].to_dict() if orig_id in emeta.index else {}
             row['session_idx'] = si
             row['orig_unit_id'] = orig_id
+            # the unit's own session on the merged clock: a unit was recorded only then,
+            # so its z-score reference must not count the other sessions' time as silence
+            row['session_start'] = float(np.asarray(ep.time_support.start)[0]) + off
+            row['session_end'] = float(np.asarray(ep.time_support.end)[-1]) + off
             meta_rows[new_id] = row
             new_id += 1
 
@@ -435,22 +453,102 @@ def event_counts(spike_times, ref_times, edges):
     return np.diff(idx, axis=1)
 
 
-def compute_unit_z(ephys, binary_signals, trial_events, bin_width, exclude_opto=True):
-    """Per-unit z-score parameters (mu, sd) computed over the full session.
+def first_lick_latency(binary_signals, cue_times, fallback=None):
+    """Seconds from each cue to the first lick after it (raw 'lick_on'); a trial without one
+    takes its fallback latency (e.g. the outcome), else inf."""
+    meta = binary_signals.metadata
+    rows = meta[meta['event'] == 'lick_on']
+    cue_times = np.asarray(cue_times, float)
+    lat = np.full(cue_times.size, np.inf)
+    if len(rows):
+        licks = np.sort(np.asarray(binary_signals[rows.index[0]].t))
+        i = np.searchsorted(licks, cue_times, 'right')
+        ok = i < licks.size
+        lat[ok] = licks[i[ok]] - cue_times[ok]
+    if fallback is not None:
+        fallback = np.asarray(fallback, float)
+        lat = np.where(np.isfinite(lat), np.minimum(lat, fallback), fallback)
+    return lat
 
-    Bins the full session (10 s before first cue → 10 s after last outcome) at
-    bin_width resolution. Returns (mu, sd) arrays of shape (n_units,).
+
+def censor_after_first_lick(trial_fr, lick_lat, t_start, bin_width):
+    """Cue-aligned (n_trials, n_bins[, ...]) rates with every bin that reaches the trial's
+    first lick set to NaN, so each trial contributes only its pre-movement activity: the
+    average past a lick is over the trials still waiting, not sensory and premotor mixed."""
+    out = np.array(trial_fr, dtype=float, copy=True)
+    bin_end = t_start + (np.arange(out.shape[1]) + 1) * bin_width
+    cut = bin_end[np.newaxis, :] > np.asarray(lick_lat)[:, np.newaxis]
+    out[cut] = np.nan
+    return out
+
+
+def latency_zorder(norm, latency):
+    """Drawing order of a latency group's trace: the earliest licks on top, the latest at the
+    bottom, by the colour normalisation the group is coloured with (z between 2 and 3)."""
+    return 3.0 - float(np.clip(norm(latency), 0.0, 1.0))
+
+
+def nan_mean_ci(x, axis=0):
+    """(mean, 95% CI half-width) over axis, ignoring NaN (censored) entries; NaN where no
+    trial is left."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        n = np.sum(~np.isnan(x), axis=axis)
+        mean = np.nanmean(x, axis=axis)
+        ci = 1.96 * np.nanstd(x, axis=axis) / np.sqrt(np.where(n > 0, n, np.nan))
+    return mean, ci
+
+
+def unit_reference_counts(ephys, binary_signals, trial_events, bin_width, exclude_opto=True):
+    """(unit ids, [spike counts per bin_width bin, one array per unit]) of the z-score reference:
+    the task period (10 s before the first cue to 10 s after the last outcome, light pulses
+    excluded), each unit only within its own session -- in a merged pseudo-session (see
+    merge_sessions' session_start / session_end) the other sessions' time is not the unit's
+    silence, it was not being recorded then."""
+    ref = get_trial_ephys(ephys, binary_signals, trial_events, exclude_opto)
+    counts = ref.count(bin_size=bin_width)
+    t = np.asarray(counts.index)
+    c = np.asarray(counts.values)
+    units = list(counts.columns)
+    md = ephys.metadata
+    if not {'session_start', 'session_end'} <= set(md.columns):
+        return units, [c[:, i] for i in range(len(units))]
+    # each session's own task period: its first cue - 10 s .. its last outcome + 10 s
+    cues = np.asarray(binary_signals[binary_signals.metadata.index[
+        binary_signals.metadata['event'] == 'start_cues'][0]].t)
+    outs = np.sort(np.concatenate([np.asarray(trial_events[k], float)
+                                   for k in ('no_stim', 'chr2', 'chrimson') if trial_events.get(k)]))
+    spans = {}
+    out = []
+    for i, u in enumerate(units):
+        a, b = float(md.loc[u, 'session_start']), float(md.loc[u, 'session_end'])
+        if (a, b) not in spans:
+            cq = cues[(cues >= a) & (cues <= b)]
+            oq = outs[(outs >= a) & (outs <= b)]
+            spans[(a, b)] = ((cq.min() - 10.0 if cq.size else a),
+                             (oq.max() + 10.0 if oq.size else b))
+        lo, hi = spans[(a, b)]
+        out.append(c[(t >= lo) & (t <= hi), i])
+    return units, out
+
+
+def compute_unit_z(ephys, binary_signals, trial_events, bin_width, exclude_opto=True):
+    """Per-unit z-score parameters (mu, sd) of the binned rate over the unit's own session.
+
+    Bins the task period (10 s before first cue → 10 s after last outcome, light pulses out)
+    at bin_width resolution, each unit within its own session only (unit_reference_counts).
+    Returns (mu, sd) arrays of shape (n_units,) in the ephys key order.
     Apply as (fr - mu) / sd to z-score any trial-windowed firing in the same units.
 
     Change the normalisation here to adjust z-scoring across all plotting functions."""
-    ephys = get_trial_ephys(ephys, binary_signals, trial_events, exclude_opto)
-    ref_fr = ephys.count(bin_size=bin_width).values / bin_width
-    mu = ref_fr.mean(axis=0)
-    sd = ref_fr.std(axis=0)
-    sd = np.where(sd < 1e-6, 1.0, sd)
+    _, counts = unit_reference_counts(ephys, binary_signals, trial_events, bin_width, exclude_opto)
+    mu = np.array([x.mean() / bin_width if x.size else np.nan for x in counts])
+    sd = np.array([x.std() / bin_width if x.size else np.nan for x in counts])
+    sd = np.where(~(sd >= 1e-6), 1.0, sd)
     return mu, sd
 
-def plot_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bin_width=0.05,
+def plot_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bin_width=BIN_WIDTH,
                          t_start=-4.0, t_end=1.0,
                          sort_window=(-0.20, 0.0),
                          clim=(-2, 5), zscore=True, label_units=False):
@@ -462,7 +560,7 @@ def plot_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bi
     n_bins = len(bin_centers)
 
     emeta = ephys.metadata.copy()
-    tranche_map = {'dSPN': 0, 'iSPN': 1}
+    tranche_map = {c: i for i, c in enumerate(TAGGED_CLASSES)}
 
     if zscore:
         z_mu, z_sd = compute_unit_z(ephys, binary_signals, trial_events, bin_width)
@@ -472,7 +570,7 @@ def plot_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bi
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -517,7 +615,7 @@ def plot_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bi
     prelick_z = prelick_z_all[np.array(keep_idx)]
 
     def _sort_key(u):
-        t = tranche_map.get(_get_classif(u), 2)
+        t = tranche_map.get(_get_classif(u), len(TAGGED_CLASSES))
         z = prelick_z[u2row[u]]
         return (t, -float(z) if np.isfinite(z) else np.inf)
 
@@ -527,7 +625,7 @@ def plot_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bi
 
     boundaries, prev_t = [], None
     for ri, u in enumerate(sorted_units):
-        t = tranche_map.get(_get_classif(u), 2)
+        t = tranche_map.get(_get_classif(u), len(TAGGED_CLASSES))
         if prev_t is not None and t != prev_t:
             boundaries.append(ri)
         prev_t = t
@@ -539,7 +637,7 @@ def plot_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bi
         start = ([0] + boundaries)[ii - 1]
         mid = (start + b) / 2.0
         cl = _get_classif(sorted_units[start])
-        name = cl if cl in ('dSPN', 'iSPN') else 'Unlabeled'
+        name = cl if cl in TAGGED_CLASSES else 'Unlabeled'
         tranche_labels.append((mid, name))
 
     conditions = [
@@ -595,7 +693,7 @@ def plot_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bi
 
 
 def plot_cue_aligned_by_latency(ephys, binary_signals, trial_events,
-                                save_path=None, bin_width=0.05,
+                                save_path=None, bin_width=BIN_WIDTH,
                                 t_start=-1.0, t_end=6.0, n_quintiles=5,
                                 zscore=True):
     """Population-average firing rate aligned to start_cue, split into lick-latency quintiles.
@@ -625,7 +723,7 @@ def plot_cue_aligned_by_latency(ephys, binary_signals, trial_events,
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -633,7 +731,7 @@ def plot_cue_aligned_by_latency(ephys, binary_signals, trial_events,
     for u in ephys.keys():
         label = _get_classif(u) or 'Unlabeled'
         tranche_units.setdefault(label, []).append(u)
-    tranche_order = [t for t in ('dSPN', 'iSPN', 'Unlabeled') if t in tranche_units]
+    tranche_order = [t for t in TAGGED_CLASSES + ('Unlabeled',) if t in tranche_units]
 
     # pool all trials across conditions, tracking condition label and lick latency
     all_cue_times = np.array([t[0] for cond in cond_trials.values() for t in cond])
@@ -668,6 +766,9 @@ def plot_cue_aligned_by_latency(ephys, binary_signals, trial_events,
         trial_fr_z = (trial_fr - z_mu[np.newaxis, np.newaxis, :]) / z_sd[np.newaxis, np.newaxis, :]
     else:
         trial_fr_z = trial_fr
+    # each trial contributes only until its first lick
+    trial_fr_z = censor_after_first_lick(
+        trial_fr_z, first_lick_latency(binary_signals, all_cue_times, all_cue_lats), t_start, bin_width)
     fsuffix = '' if zscore else '_raw'
     fr_ylabel = 'Firing rate (z-score)' if zscore else 'spks/s'
 
@@ -676,7 +777,7 @@ def plot_cue_aligned_by_latency(ephys, binary_signals, trial_events,
     ns_lats = all_cue_lats[ns_idx]
     mean_lat_ns = float(ns_lats.mean()) if len(ns_idx) > 0 else 1.0
     pl_mask = (bin_centers >= mean_lat_ns - 0.2) & (bin_centers < mean_lat_ns)
-    unit_prelick_z = trial_fr_z[ns_idx][:, pl_mask, :].mean(axis=(0, 1))  # (n_units,)
+    unit_prelick_z = nan_mean_ci(trial_fr_z[ns_idx][:, pl_mask, :].reshape(-1, trial_fr_z.shape[2]))[0]  # (n_units,)
 
     unlabeled = tranche_units.get('Unlabeled', [])
     if unlabeled:
@@ -723,10 +824,10 @@ def plot_cue_aligned_by_latency(ephys, binary_signals, trial_events,
                     q_global = cond_idx[q_assign == q]
                     if len(q_global) == 0:
                         continue
-                    pop_z = trial_fr_z[q_global][:, :, t_cols].mean(axis=(0, 2))
+                    pop_z = nan_mean_ci(trial_fr_z[q_global][:, :, t_cols].mean(axis=2))[0]
                     color = cmap(norm(mean_lats[q]))
-                    ax.plot(bin_centers, pop_z, color=color, linewidth=1.5)
-                    ax.axvline(mean_lats[q], color=color, linestyle='--', linewidth=1.0, alpha=0.7)
+                    ax.plot(bin_centers, pop_z, color=color, linewidth=1.5, zorder=latency_zorder(norm, mean_lats[q]))
+                    ax.axvline(mean_lats[q], color=color, linestyle='--', linewidth=1.0, alpha=0.7, zorder=latency_zorder(norm, mean_lats[q]))
 
             ax.axvline(0, color='k', linestyle='-', linewidth=1, alpha=0.75)
             if ci == 0:
@@ -758,7 +859,7 @@ def plot_cue_aligned_by_latency(ephys, binary_signals, trial_events,
     return fig, cbar_fig
 
 
-def plot_outcome_heatmap_nostim(ephys, binary_signals, trial_events, save_path=None, bin_width=0.05,
+def plot_outcome_heatmap_nostim(ephys, binary_signals, trial_events, save_path=None, bin_width=BIN_WIDTH,
                                 t_start=-4.0, t_end=1.0,
                                 sort_window=(-0.20, 0.0),
                                 clim=(-2, 5), zscore=True, ms_censored=None):
@@ -779,7 +880,7 @@ def plot_outcome_heatmap_nostim(ephys, binary_signals, trial_events, save_path=N
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -828,7 +929,7 @@ def plot_outcome_heatmap_nostim(ephys, binary_signals, trial_events, save_path=N
         tranche_groups.setdefault(_get_classif(u), []).append(u)
     if unlabeled:
         tranche_groups['Unlabeled'] = unlabeled
-    tranche_order = [t for t in ('dSPN', 'iSPN', 'Unlabeled') if t in tranche_groups]
+    tranche_order = [t for t in TAGGED_CLASSES + ('Unlabeled',) if t in tranche_groups]
 
     for label in tranche_order:
         tranche_groups[label].sort(
@@ -879,7 +980,7 @@ def plot_outcome_heatmap_nostim(ephys, binary_signals, trial_events, save_path=N
     return fig
 
 
-def plot_cue_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bin_width=0.05,
+def plot_cue_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None, bin_width=BIN_WIDTH,
                               t_start_cue=-1.0, t_end_cue=4.0,
                               t_start_outcome=-4.0, t_end_outcome=1.0,
                               sort_window=(-0.20, 0.0),
@@ -905,7 +1006,7 @@ def plot_cue_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -962,7 +1063,7 @@ def plot_cue_outcome_heatmap(ephys, binary_signals, trial_events, save_path=None
         tranche_groups.setdefault(_get_classif(u), []).append(u)
     if unlabeled:
         tranche_groups['Unlabeled'] = unlabeled
-    tranche_order = [t for t in ('dSPN', 'iSPN', 'Unlabeled') if t in tranche_groups]
+    tranche_order = [t for t in TAGGED_CLASSES + ('Unlabeled',) if t in tranche_groups]
 
     for label in tranche_order:
         tranche_groups[label].sort(
@@ -1036,7 +1137,7 @@ def plot_spn_heatmap(ephys, binary_signals, trial_events, **kwargs):
 
 
 def plot_cue_aligned_nostim(ephys, binary_signals, trial_events,
-                            save_path=None, bin_width=0.05,
+                            save_path=None, bin_width=BIN_WIDTH,
                             t_start=-1.0, t_end=7.0, n_quintiles=5,
                             zscore=True, ms_censored=None,
                             labeled_only=False, right_label_rotation=90):
@@ -1068,7 +1169,7 @@ def plot_cue_aligned_nostim(ephys, binary_signals, trial_events,
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -1076,7 +1177,7 @@ def plot_cue_aligned_nostim(ephys, binary_signals, trial_events,
     for u in ephys.keys():
         label = _get_classif(u) or 'Unlabeled'
         tranche_units.setdefault(label, []).append(u)
-    tranche_order = [t for t in ('dSPN', 'iSPN', 'Unlabeled') if t in tranche_units and (not labeled_only or t != 'Unlabeled')]
+    tranche_order = [t for t in TAGGED_CLASSES + ('Unlabeled',) if t in tranche_units and (not labeled_only or t != 'Unlabeled')]
 
     cue_times = np.array([t[0] for t in trials])
     lats = np.array([t[1] for t in trials])
@@ -1110,13 +1211,16 @@ def plot_cue_aligned_nostim(ephys, binary_signals, trial_events,
         trial_fr_z = (trial_fr - z_mu[np.newaxis, np.newaxis, :]) / z_sd[np.newaxis, np.newaxis, :]
     else:
         trial_fr_z = trial_fr
+    # each trial contributes only until its first lick
+    trial_fr_z = censor_after_first_lick(
+        trial_fr_z, first_lick_latency(binary_signals, cue_times, lats), t_start, bin_width)
     fsuffix = '' if zscore else '_raw'
     fr_ylabel = 'Z(FR)' if zscore else 'spks/s'
 
     # filter unlabeled to top quartile by pre-lick score
     mean_lat = float(lats.mean())
     pl_mask = (bin_centers >= mean_lat - 0.2) & (bin_centers < mean_lat)
-    unit_prelick_z = trial_fr_z[:, pl_mask, :].mean(axis=(0, 1))
+    unit_prelick_z = nan_mean_ci(trial_fr_z[:, pl_mask, :].reshape(-1, trial_fr_z.shape[2]))[0]
     unlabeled = tranche_units.get('Unlabeled', [])
     if unlabeled:
         ul_cols = np.array([u2col[u] for u in unlabeled])
@@ -1142,10 +1246,10 @@ def plot_cue_aligned_nostim(ephys, binary_signals, trial_events,
             q_idx = np.where(q_assign == q)[0]
             if len(q_idx) == 0:
                 continue
-            pop_z = trial_fr_z[q_idx][:, :, t_cols].mean(axis=(0, 2))
+            pop_z = nan_mean_ci(trial_fr_z[q_idx][:, :, t_cols].mean(axis=2))[0]
             color = cmap(norm(mean_lats[q]))
-            ax.plot(bin_centers, pop_z, color=color, linewidth=1.5)
-            ax.axvline(mean_lats[q], color=color, linestyle='--', linewidth=1.0, alpha=0.7)
+            ax.plot(bin_centers, pop_z, color=color, linewidth=1.5, zorder=latency_zorder(norm, mean_lats[q]))
+            ax.axvline(mean_lats[q], color=color, linestyle='--', linewidth=1.0, alpha=0.7, zorder=latency_zorder(norm, mean_lats[q]))
         ax.axvline(0, color='k', linestyle='-', linewidth=1, alpha=0.75)
         ax.set_ylabel(fr_ylabel)
         ax.spines['top'].set_visible(False)
@@ -1183,7 +1287,7 @@ def plot_cue_aligned_nostim(ephys, binary_signals, trial_events,
 
 
 def plot_spn_cue_aligned_nostim(ephys, binary_signals, trial_events,
-                                save_path=None, bin_width=0.05,
+                                save_path=None, bin_width=BIN_WIDTH,
                                 t_start=-1.0, t_end=7.0, n_quintiles=5,
                                 zscore=True, ms_censored=None):
     """dSPN / iSPN cue-aligned PSTH + trial-by-trial dSPN−iSPN difference (3rd row).
@@ -1211,7 +1315,7 @@ def plot_spn_cue_aligned_nostim(ephys, binary_signals, trial_events,
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -1220,7 +1324,7 @@ def plot_spn_cue_aligned_nostim(ephys, binary_signals, trial_events,
         label = _get_classif(u)
         if label is not None:
             tranche_units.setdefault(label, []).append(u)
-    tranche_order = [t for t in ('dSPN', 'iSPN') if t in tranche_units]
+    tranche_order = [t for t in TAGGED_CLASSES if t in tranche_units]
 
     cue_times = np.array([t[0] for t in trials])
     lats      = np.array([t[1] for t in trials])
@@ -1254,6 +1358,9 @@ def plot_spn_cue_aligned_nostim(ephys, binary_signals, trial_events,
         trial_fr_z = (trial_fr - z_mu[np.newaxis, np.newaxis, :]) / z_sd[np.newaxis, np.newaxis, :]
     else:
         trial_fr_z = trial_fr
+    # each trial contributes only until its first lick
+    trial_fr_z = censor_after_first_lick(
+        trial_fr_z, first_lick_latency(binary_signals, cue_times, lats), t_start, bin_width)
     fsuffix  = '' if zscore else '_raw'
     fr_ylabel = 'Z(FR)' if zscore else 'spks/s'
 
@@ -1286,10 +1393,10 @@ def plot_spn_cue_aligned_nostim(ephys, binary_signals, trial_events,
             q_idx = np.where(q_assign == q)[0]
             if len(q_idx) == 0:
                 continue
-            pop_z = trial_fr_z[q_idx][:, :, t_cols].mean(axis=(0, 2))
+            pop_z = nan_mean_ci(trial_fr_z[q_idx][:, :, t_cols].mean(axis=2))[0]
             color = cmap(norm(mean_lats[q]))
-            ax.plot(bin_centers, pop_z, color=color, linewidth=1.5)
-            ax.axvline(mean_lats[q], color=color, linestyle='--', linewidth=1.0, alpha=0.7)
+            ax.plot(bin_centers, pop_z, color=color, linewidth=1.5, zorder=latency_zorder(norm, mean_lats[q]))
+            ax.axvline(mean_lats[q], color=color, linestyle='--', linewidth=1.0, alpha=0.7, zorder=latency_zorder(norm, mean_lats[q]))
         ax.axvline(0, color='k', linestyle='-', linewidth=1, alpha=0.75)
         ax.axvspan(3.33, 7.0, ymin=0.92, ymax=1.0, color='green', alpha=0.45, linewidth=0)
         ax.axvspan(0,3.33, ymin=0.92, ymax=1.0, color='red', alpha=0.45, linewidth=0)
@@ -1310,10 +1417,10 @@ def plot_spn_cue_aligned_nostim(ephys, binary_signals, trial_events,
             q_idx = np.where(q_assign == q)[0]
             if len(q_idx) == 0:
                 continue
-            diff_q = trial_diff[q_idx].mean(axis=0)
+            diff_q = nan_mean_ci(trial_diff[q_idx])[0]
             color  = cmap(norm(mean_lats[q]))
-            ax.plot(bin_centers, diff_q, color=color, linewidth=1.5)
-            ax.axvline(mean_lats[q], color=color, linestyle='--', linewidth=1.0, alpha=0.7)
+            ax.plot(bin_centers, diff_q, color=color, linewidth=1.5, zorder=latency_zorder(norm, mean_lats[q]))
+            ax.axvline(mean_lats[q], color=color, linestyle='--', linewidth=1.0, alpha=0.7, zorder=latency_zorder(norm, mean_lats[q]))
         ax.axhline(0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
         ax.axvline(0, color='k', linestyle='-', linewidth=1, alpha=0.75)
         ax.axvspan(3.33, 7.0, ymin=0.92, ymax=1.0, color='green', alpha=0.45, linewidth=0)
@@ -1358,7 +1465,7 @@ def plot_spn_cue_aligned_nostim(ephys, binary_signals, trial_events,
 
 
 def plot_spn_mean_psth(ephys, binary_signals, trial_events,
-                       save_path=None, bin_width=0.05,
+                       save_path=None, bin_width=BIN_WIDTH,
                        t_start_cue=-0.5, t_end_cue= 4.0,
                        t_start_outcome=-4.0, t_end_outcome=0.5,
                        zscore=True, ms_censored=None, outcome_range=None):
@@ -1374,7 +1481,7 @@ def plot_spn_mean_psth(ephys, binary_signals, trial_events,
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -1458,12 +1565,14 @@ def plot_spn_mean_psth(ephys, binary_signals, trial_events,
         sem = per_trial.std(axis=0) / np.sqrt(n_total)
         return m, m - 1.96 * sem, m + 1.96 * sem
 
-    rows = [
-        ('dSPN',      _mean_ci(trial_fr_cue, dspn_cols), _mean_ci(trial_fr_out, dspn_cols)),
-        ('iSPN',      _mean_ci(trial_fr_cue, ispn_cols),  _mean_ci(trial_fr_out, ispn_cols)),
-    ]
+    class_cols = _class_cols(tranche_units, u2col)
+    rows = [(c, _mean_ci(trial_fr_cue, class_cols[c]), _mean_ci(trial_fr_out, class_cols[c]))
+            for c in _spn_rows(class_cols) if c != 'dSPN-iSPN']
     if has_diff:
         rows.append(('dSPN-iSPN', _diff_ci(trial_fr_cue), _diff_ci(trial_fr_out)))
+    if not rows:  # e.g. a single session whose lick-modulated units include no tagged unit
+        print("plot_spn_mean_psth: no tagged units; skipping.")
+        return None
 
     n_rows = len(rows)
     fig, axs = plt.subplots(n_rows, 2, figsize=(2, n_rows),
@@ -1528,15 +1637,21 @@ def plot_spn_mean_psth(ephys, binary_signals, trial_events,
     return fig
 
 
-def _spn_rows(dspn_cols, ispn_cols):
-    """The rows of a dSPN / iSPN / difference figure: the cell types present, and their
-    difference when both are. A single session can lack one type altogether."""
-    rows = [c for c, cols in (('dSPN', dspn_cols), ('iSPN', ispn_cols)) if len(cols)]
-    return rows + (['dSPN-iSPN'] if len(rows) == 2 else [])
+def _class_cols(tranche_units, u2col):
+    """{class: column indices of its units} for every TAGGED_CLASSES class (empty if absent)."""
+    return {c: np.array([u2col[u] for u in tranche_units.get(c, [])], dtype=int)
+            for c in TAGGED_CLASSES}
+
+
+def _spn_rows(class_cols):
+    """The rows of a per-class figure: the TAGGED_CLASSES present, then the dSPN - iSPN
+    difference when both are. A single session can lack any class altogether."""
+    rows = [c for c in TAGGED_CLASSES if len(class_cols.get(c, []))]
+    return rows + (['dSPN-iSPN'] if 'dSPN' in rows and 'iSPN' in rows else [])
 
 
 def plot_spn_rew_unrew_psth(ephys, binary_signals, trial_events,
-                             save_path=None, bin_width=0.05,
+                             save_path=None, bin_width=BIN_WIDTH,
                              t_start_cue=-1.0, t_end_cue=7.0,
                              t_start_outcome=-1.5, t_end_outcome=2.0,
                              zscore=True,
@@ -1554,7 +1669,7 @@ def plot_spn_rew_unrew_psth(ephys, binary_signals, trial_events,
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -1643,9 +1758,10 @@ def plot_spn_rew_unrew_psth(ephys, binary_signals, trial_events,
         ('rewarded',   rew_idx,   'green',  'Rewarded'),
         ('unrewarded', unrew_idx, 'maroon', 'Unrewarded'),
     ]
-    row_labels = _spn_rows(dspn_cols, ispn_cols)
+    class_cols = _class_cols(tranche_units, u2col)
+    row_labels = _spn_rows(class_cols)
     if not row_labels:
-        print("No dSPN or iSPN units; skipping.")
+        print("No tagged units; skipping.")
         return None
     n_rows = len(row_labels)
 
@@ -1668,10 +1784,8 @@ def plot_spn_rew_unrew_psth(ephys, binary_signals, trial_events,
                     continue
                 if is_diff:
                     m, lo, hi = _diff_stats(fr, idx)
-                elif row_label == 'dSPN':
-                    m, lo, hi = _stats(fr, dspn_cols, idx)
                 else:
-                    m, lo, hi = _stats(fr, ispn_cols, idx)
+                    m, lo, hi = _stats(fr, class_cols[row_label], idx)
                 ax.fill_between(centers, lo, hi, color=color, alpha=0.2, linewidth=0)
                 ax.plot(centers, m, color=color, linewidth=1.5)
 
@@ -1729,7 +1843,7 @@ def plot_spn_rew_unrew_psth(ephys, binary_signals, trial_events,
 
 
 def plot_spn_summary(ephys, binary_signals, trial_events,
-                     save_path=None, bin_width=0.05,
+                     save_path=None, bin_width=BIN_WIDTH,
                      t_start_cue=-1.5, t_end_cue=7.5,
                      t_start_outcome=-0.75, t_end_outcome=0.5,
                      t_start_bout=-0.75, t_end_bout=0.5,
@@ -1754,7 +1868,7 @@ def plot_spn_summary(ephys, binary_signals, trial_events,
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -1811,7 +1925,10 @@ def plot_spn_summary(ephys, binary_signals, trial_events,
             fr = (fr - z_mu[np.newaxis, np.newaxis, :]) / z_sd[np.newaxis, np.newaxis, :]
         return fr
 
-    q_fr   = _hist(q_cue_times,  cue_edges,  n_cue_bins)
+    # cue-aligned quintile trials contribute only until their first lick
+    q_fr   = censor_after_first_lick(_hist(q_cue_times, cue_edges, n_cue_bins),
+                                     first_lick_latency(binary_signals, q_cue_times, q_lats),
+                                     t_start_cue, bin_width)
     out_fr = _hist(filt_out_times, out_edges, n_out_bins)
 
     # Lick-bout PSTH
@@ -1839,9 +1956,10 @@ def plot_spn_summary(ephys, binary_signals, trial_events,
     ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])], dtype=int)
     has_diff   = len(dspn_cols) > 0 and len(ispn_cols) > 0
 
-    row_labels = _spn_rows(dspn_cols, ispn_cols)
+    class_cols = _class_cols(tranche_units, u2col)
+    row_labels = _spn_rows(class_cols)
     if not row_labels:
-        print("No dSPN or iSPN units; skipping.")
+        print("No tagged units; skipping.")
         return None
     n_rows     = len(row_labels)
 
@@ -1861,7 +1979,7 @@ def plot_spn_summary(ephys, binary_signals, trial_events,
     qnorm     = plt.Normalize(vmin=float(q_lats.min()), vmax=float(q_lats.max()))
     fr_ylabel = 'Z(FR)' if zscore else 'spks/s'
     fsuffix   = '' if zscore else '_raw'
-    row_colors = {'dSPN': 'tab:blue', 'iSPN': 'tab:orange', 'dSPN-iSPN': 'black'}
+    row_colors = CLASS_COLORS
     _fmt       = _FuncFormatter(lambda x, _: f'{x:g}')
 
     bout_idx = np.arange(len(bout_times))
@@ -1871,7 +1989,7 @@ def plot_spn_summary(ephys, binary_signals, trial_events,
 
     for ri, row_label in enumerate(row_labels):
         is_diff = row_label == 'dSPN-iSPN'
-        cols    = dspn_cols if row_label == 'dSPN' else ispn_cols
+        cols    = class_cols.get(row_label)
         color   = row_colors[row_label]
 
         # --- Col 0: lick-bout PSTH ---
@@ -1907,12 +2025,12 @@ def plot_spn_summary(ephys, binary_signals, trial_events,
                 continue
             qcolor = qcmap(qnorm(mean_lats[q]))
             if is_diff:
-                y = (q_fr[qi][:, :, dspn_cols].mean(axis=2) -
-                     q_fr[qi][:, :, ispn_cols].mean(axis=2)).mean(axis=0)
+                y = nan_mean_ci(q_fr[qi][:, :, dspn_cols].mean(axis=2) -
+                                q_fr[qi][:, :, ispn_cols].mean(axis=2))[0]
             else:
-                y = q_fr[qi][:, :, cols].mean(axis=(0, 2))
-            ax2.axvline(mean_lats[q], color=qcolor, linestyle='--', linewidth=1.0, alpha=0.7)
-            ax2.plot(cue_centers, y, color=qcolor, linewidth=1.0, alpha=0.95)
+                y = nan_mean_ci(q_fr[qi][:, :, cols].mean(axis=2))[0]
+            ax2.axvline(mean_lats[q], color=qcolor, linestyle='--', linewidth=1.0, alpha=0.7, zorder=latency_zorder(qnorm, mean_lats[q]))
+            ax2.plot(cue_centers, y, color=qcolor, linewidth=1.0, alpha=0.95, zorder=latency_zorder(qnorm, mean_lats[q]))
         if is_diff:
             ax2.axhline(0, color='k', linewidth=0.8, alpha=0.5)
         ax2.axvline(0, color='k', linewidth=1, alpha=0.75)
@@ -1967,7 +2085,7 @@ def plot_spn_summary(ephys, binary_signals, trial_events,
 
 
 def plot_dspn_isPN_diff(ephys, binary_signals, trial_events,
-                        save_path=None, bin_width=0.05,
+                        save_path=None, bin_width=BIN_WIDTH,
                         t_start=-1.0, t_end=7.0, n_quintiles=5,
                         t_start_outcome=-8.0, t_end_outcome=1.0,
                         zscore=True, ms_censored=None):
@@ -2184,6 +2302,9 @@ def plot_dspn_isPN_diff(ephys, binary_signals, trial_events,
         cue_fr_z = (cue_fr - z_mu[np.newaxis, np.newaxis, :]) / z_sd[np.newaxis, np.newaxis, :]
     else:
         cue_fr_z = cue_fr
+    # each trial contributes only until its first lick
+    cue_fr_z = censor_after_first_lick(
+        cue_fr_z, first_lick_latency(binary_signals, all_cue_times, all_cue_lats), t_start, bin_width)
 
     cmap = _turbo_dark
     norm = plt.Normalize(vmin=float(all_cue_lats.min()), vmax=float(all_cue_lats.max()))
@@ -2199,12 +2320,10 @@ def plot_dspn_isPN_diff(ephys, binary_signals, trial_events,
                 continue
             mean_lat = lats[q_sub].mean()
             color = cmap(norm(mean_lat))
-            diff = _diff(cue_fr_z, cue_nb, trial_idx[q_sub])
-            mean = diff.mean(axis=0)
-            ci95 = 1.96 * diff.std(axis=0) / np.sqrt(len(q_sub))
-            ax.plot(cue_bc, mean, color=color, linewidth=1.5)
-            ax.fill_between(cue_bc, mean - ci95, mean + ci95, color=color, alpha=0.2)
-            ax.axvline(mean_lat, color=color, linestyle='--', linewidth=0.8, alpha=0.6)
+            mean, ci95 = nan_mean_ci(_diff(cue_fr_z, cue_nb, trial_idx[q_sub]))
+            ax.plot(cue_bc, mean, color=color, linewidth=1.5, zorder=latency_zorder(norm, mean_lat))
+            ax.fill_between(cue_bc, mean - ci95, mean + ci95, color=color, alpha=0.2, zorder=latency_zorder(norm, mean_lat) - 1)
+            ax.axvline(mean_lat, color=color, linestyle='--', linewidth=0.8, alpha=0.6, zorder=latency_zorder(norm, mean_lat))
 
     # ── Figure 3: all conditions, cue-aligned, latency-binned ────────────────
     fig3, ax = plt.subplots(figsize=(1, 1))
@@ -2222,12 +2341,10 @@ def plot_dspn_isPN_diff(ephys, binary_signals, trial_events,
                 continue
             mean_lat = lats[q_sub].mean()
             tcolor = cmap(norm(mean_lat))
-            diff = _diff(cue_fr_z, cue_nb, idx[q_sub])
-            mean = diff.mean(axis=0)
-            ci95 = 1.96 * diff.std(axis=0) / np.sqrt(len(q_sub))
-            ax.plot(cue_bc, mean, color=tcolor, linestyle=ls, linewidth=1.2)
-            ax.fill_between(cue_bc, mean - ci95, mean + ci95, color=tcolor, alpha=0.15)
-            ax.axvline(mean_lat, color=tcolor, linestyle='--', linewidth=0.6, alpha=0.5)
+            mean, ci95 = nan_mean_ci(_diff(cue_fr_z, cue_nb, idx[q_sub]))
+            ax.plot(cue_bc, mean, color=tcolor, linestyle=ls, linewidth=1.2, zorder=latency_zorder(norm, mean_lat))
+            ax.fill_between(cue_bc, mean - ci95, mean + ci95, color=tcolor, alpha=0.15, zorder=latency_zorder(norm, mean_lat) - 1)
+            ax.axvline(mean_lat, color=tcolor, linestyle='--', linewidth=0.6, alpha=0.5, zorder=latency_zorder(norm, mean_lat))
 
     _ax_decor(ax, 't(s) from cue')
     ax.set_ylim(-1, 1)
@@ -2487,7 +2604,7 @@ def plot_lick_latency(binary_signals, trial_events, save_path=None):
 
 
 def plot_dspn_isPN_bar(ephys, binary_signals, trial_events,
-                       save_path=None, bin_width=0.05,
+                       save_path=None, bin_width=BIN_WIDTH,
                        pre_window=(-0.2, 0.0),
                        ms_censored=None):
     """Bar: dSPN − iSPN z-scored activity in pre-cue vs pre-outcome window, no-stim only.
@@ -2630,7 +2747,7 @@ def plot_dspn_isPN_bar(ephys, binary_signals, trial_events,
 
 
 def plot_dspn_ispn_lick_bout_bar(ephys, binary_signals, trial_events,
-                                  save_path=None, bin_width=0.05,
+                                  save_path=None, bin_width=BIN_WIDTH,
                                   pre_bout_window=(-0.2, 0.0),
                                   baseline_window=(-1.2, -1.0)):
     """Bar: dSPN − iSPN z-scored activity in pre_bout_window vs baseline_window,
@@ -2792,7 +2909,7 @@ def print_opto_timing_check(trial_events, binary_signals, ch_on, ch_off, c2_on, 
 
 
 def plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, save_path=None,
-                             bin_width=0.05, t_start=-2.0, t_end=1.0, zscore=True):
+                             bin_width=BIN_WIDTH, t_start=-2.0, t_end=1.0, zscore=True):
     """Population PSTH aligned to lick_bout_starts, split by dSPN / iSPN.
 
     Style matches the middle column of plot_spn_summary: mean ± 95% CI per
@@ -2838,7 +2955,7 @@ def plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, save_path=None,
     def _get_classif(u):
         if 'final_classif' in emeta.columns and u in emeta.index:
             c = emeta.loc[u, 'final_classif']
-            if c in ('dSPN', 'iSPN'):
+            if c in TAGGED_CLASSES:
                 return c
         return None
 
@@ -2852,9 +2969,10 @@ def plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, save_path=None,
     ispn_cols  = np.array([u2col[u] for u in tranche_units.get('iSPN', [])], dtype=int)
     has_diff   = len(dspn_cols) > 0 and len(ispn_cols) > 0
 
-    row_labels = _spn_rows(dspn_cols, ispn_cols)
+    class_cols = _class_cols(tranche_units, u2col)
+    row_labels = _spn_rows(class_cols)
     if not row_labels:
-        print("No dSPN or iSPN units; skipping.")
+        print("No tagged units; skipping.")
         return None
     n_rows     = len(row_labels)
 
@@ -2873,7 +2991,7 @@ def plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, save_path=None,
     _fmt      = _FuncFormatter(lambda x, _: f'{x:g}')
     fr_ylabel = 'Z(FR)' if zscore else 'spks/s'
     fsuffix   = '' if zscore else '_raw'
-    colors    = {'dSPN': 'green', 'iSPN': 'maroon', 'dSPN-iSPN': 'black'}
+    colors    = {**CLASS_COLORS, 'dSPN': 'green', 'iSPN': 'maroon'}
 
     fig, axs = plt.subplots(n_rows, 1, squeeze=False)
 
@@ -2882,8 +3000,7 @@ def plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, save_path=None,
         is_diff  = row_label == 'dSPN-iSPN'
         color    = colors[row_label]
 
-        m, lo, hi = _diff_stats() if is_diff else _stats(
-            dspn_cols if row_label == 'dSPN' else ispn_cols)
+        m, lo, hi = _diff_stats() if is_diff else _stats(class_cols[row_label])
 
         ax.fill_between(bin_centers, lo, hi, color=color, alpha=0.2, linewidth=0)
         ax.plot(bin_centers, m, color=color, linewidth=1.5)
@@ -2932,7 +3049,7 @@ def plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, save_path=None,
 # PSTH/heatmap functions (which collapse everything that is not dSPN/iSPN), these
 # keep muSPN as its own category — the whole point of a breakdown plot is to show
 # where units actually land.
-_CATEGORY_ORDER = ('dSPN', 'iSPN', 'muSPN', 'untagged')
+_CATEGORY_ORDER = TAGGED_CLASSES + ('untagged',)
 _BEESWARM_MARKERS = ('o', 's', '^', 'D', 'v', 'P', 'X', '*', '<', '>')
 
 
@@ -2971,6 +3088,69 @@ def _order_categories(present):
     """Known categories first in _CATEGORY_ORDER, then anything unexpected, alphabetically."""
     known = [c for c in _CATEGORY_ORDER if c in present]
     return known + sorted(c for c in present if c not in _CATEGORY_ORDER)
+
+
+def plot_binned_rate_distributions(ephys, binary_signals, trial_events, save_path=None,
+                                   bin_width=BIN_WIDTH, max_pct=99.5):
+    """Distribution of each unit's binned firing rates -- the very bins compute_unit_z takes
+    its mean and SD from (bin_width bins over the task period, light pulses and inter-session
+    gaps excluded) -- one panel per unit category, a thin line per unit coloured by its mean
+    rate, the grand average (mean of the units' distributions) in black.
+
+    A bin holds a whole number of spikes, so the rates come in steps of 1 / bin_width
+    (10 Hz at 100 ms). The x axis runs to the largest per-unit max_pct percentile of counts, so
+    the fastest unit's distribution is shown whole.
+    Saves <save_path stem>.png/.svg/.txt when save_path is given; returns the Figure."""
+    units, cs = unit_reference_counts(ephys, binary_signals, trial_events, bin_width)
+    cs = [np.asarray(x).astype(int) for x in cs]
+    if not units or not any(x.size for x in cs):
+        print('plot_binned_rate_distributions: no bins; skipping.')
+        return None
+    k_max = max(int(np.ceil(max(np.percentile(x, max_pct) for x in cs if x.size))), 2)
+    ks = np.arange(k_max + 1)
+    rates = ks / bin_width
+    frac = np.stack([np.bincount(np.minimum(x, k_max + 1), minlength=k_max + 2)[:k_max + 1] / max(x.size, 1)
+                     for x in cs])          # (n_units, k_max + 1)
+    mean_hz = np.array([x.mean() / bin_width if x.size else np.nan for x in cs])
+    n_bins = int(np.median([x.size for x in cs]))
+    emeta = ephys.metadata
+    cat = {u: _unit_category(emeta, u) for u in units}
+    order = _order_categories(set(cat.values()))
+    norm = mcolors.LogNorm(vmin=max(float(np.min(mean_hz[mean_hz > 0])) if np.any(mean_hz > 0) else 0.1, 0.05),
+                           vmax=max(float(mean_hz.max()), 1.0))
+    cmap = _turbo_dark
+
+    fig, axs = plt.subplots(1, len(order), figsize=(1.6 * len(order), 1.4), sharey=True, squeeze=False)
+    for ax, cg in zip(axs[0], order):
+        idx = [i for i, u in enumerate(units) if cat[u] == cg]
+        for i in idx:
+            y = np.where(frac[i] > 0, frac[i], np.nan)
+            ax.plot(rates, y, color=cmap(norm(max(mean_hz[i], norm.vmin))), lw=0.5, alpha=0.6)
+        if idx:
+            grand = frac[idx].mean(axis=0)
+            ax.plot(rates, np.where(grand > 0, grand, np.nan), color='k', lw=1.8)
+        ax.set_yscale('log')
+        ax.set_title(f'{cg} (n={len(idx)})', fontsize=8)
+        ax.set_xlabel(f'FR in {bin_width * 1000:g}-ms bin (Hz)', fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+    axs[0, 0].set_ylabel('fraction of bins', fontsize=8)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=axs[0].tolist(), fraction=0.03, pad=0.02)
+    cb.set_label('unit mean FR (Hz)', fontsize=7)
+    cb.ax.tick_params(labelsize=6)
+    if save_path is not None:
+        save_path = Path(save_path)
+        stem = save_path.parent / save_path.stem
+        stem.with_suffix('.txt').write_text(
+            f'Distribution of {bin_width * 1000:g}-ms binned firing rates (the z-score bins), '
+            f'median {n_bins} bins per unit (its own session)\n' +
+            '\n'.join(f'{cg}: n={sum(1 for u in units if cat[u] == cg)}' for cg in order))
+        fig.savefig(stem.with_suffix('.svg'), bbox_inches='tight')
+        fig.savefig(stem.with_suffix('.png'), dpi=150, bbox_inches='tight')
+    return fig
 
 
 def _bootstrap_ci(values, n_boot=10000, ci=(2.5, 97.5), seed=42):

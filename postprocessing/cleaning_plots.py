@@ -16,6 +16,8 @@ parallel extraction pass over the recording.
 """
 from pathlib import Path
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -320,3 +322,134 @@ def _noise_overview(items, t_ms, folder, per_row=10):
                  '(unit, spike count)', fontsize=10)
     fig.tight_layout()
     return _save(fig, folder, 'noise_units_overview')
+
+
+MERGE_COLORS = ('#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b')
+
+
+def _ccg(ta, tb, max_ms=20.0, bin_ms=0.5, exclude_zero=False):
+    """Counts of tb - ta lags within +-max_ms (ms bins); ta, tb sorted seconds."""
+    edges = np.arange(-max_ms, max_ms + bin_ms / 2, bin_ms) / 1000.0
+    lo = np.searchsorted(tb, ta - edges[-1], 'left')
+    hi = np.searchsorted(tb, ta + edges[-1], 'right')
+    lags = np.concatenate([tb[l:h] - x for x, l, h in zip(ta, lo, hi)]) if len(ta) else np.array([])
+    if exclude_zero:
+        lags = lags[lags != 0]
+    return np.histogram(lags, edges)[0], edges * 1000.0
+
+
+def plot_merge_report(analyzer, members, folder, title, notes=(), names=None, n_show=150, seed=0,
+                      file_name=None):
+    """One figure for a merge, drawn from the analyzer *before* it (the members still exist).
+
+    Rows: (1) every member's random-spike waveforms and template on the 4 channels where the
+    members' templates are largest; (2) amplitude over time per member, spikes per minute per
+    member (whether they take turns), each member's and the pooled autocorrelogram, the
+    cross-correlogram of the first two members (the refractory dip, or its absence) and the
+    members' locations. `notes`: the numbers that decided the merge, printed in the title.
+    """
+    rng = np.random.default_rng(seed)
+    names = names or {}
+    fs = analyzer.sampling_frequency
+    T_s = analyzer.get_total_samples() / fs
+    tpl = analyzer.get_extension('templates')
+    wfe = analyzer.get_extension('waveforms')
+    nb = wfe.nbefore
+    temps = {u: tpl.get_unit_template(u) for u in members}
+    amp = np.max([np.abs(t).max(axis=0) for t in temps.values()], axis=0)
+    chans = np.sort(np.argsort(amp)[::-1][:4])
+    pk = int(np.argmax(amp[chans]))
+    t_ms = (np.arange(next(iter(temps.values())).shape[0]) - nb) / fs * 1000.0
+    trains = {u: analyzer.sorting.get_unit_spike_train(u) / fs for u in members}
+    amps = analyzer.get_extension('spike_amplitudes').get_data(outputs='by_unit')[0] \
+        if analyzer.has_extension('spike_amplitudes') else {}
+    loc = analyzer.get_extension('unit_locations').get_data() if analyzer.has_extension('unit_locations') else None
+    ids = list(analyzer.unit_ids)
+    label = {u: f'{u}' + (f' ({names[u]})' if u in names else '') for u in members}
+
+    fig = plt.figure(figsize=(20, 8.5))
+    gs = fig.add_gridspec(2, 6)
+    for ci, ch in enumerate(chans):
+        ax = fig.add_subplot(gs[0, ci if ci < 4 else 3])
+        for k, u in enumerate(members):
+            col = MERGE_COLORS[k % len(MERGE_COLORS)]
+            w = wfe.get_waveforms_one_unit(u, force_dense=True)
+            if len(w):
+                pick = _pick(len(w), n_show, rng)
+                segs = np.stack([np.broadcast_to(t_ms, (pick.size, t_ms.size)), w[pick, :, ch]], -1)
+                ax.add_collection(LineCollection(segs, colors=col, linewidths=0.4, alpha=0.1))
+            ax.plot(t_ms, temps[u][:, ch], color=col, lw=1.8, label=label[u] if ci == 0 else None)
+        ax.autoscale_view()
+        ax.set_title(f'{analyzer.channel_ids[ch]}' + ('  (peak)' if ci == pk else ''), fontsize=8)
+        ax.set_xlabel('t (ms)')
+        if ci == 0:
+            ax.set_ylabel('uV')
+            ax.legend(fontsize=7)
+    # the members' locations
+    ax = fig.add_subplot(gs[0, 4])
+    if loc is not None:
+        allxy = loc[:, :2]
+        ax.scatter(allxy[:, 0], allxy[:, 1], s=4, color='0.8', lw=0)
+        # a unit made in the cleaning may not have a location yet (the extension is recomputed
+        # after the peeling): the centre of mass of its template's peak-to-peak amplitudes
+        cxy = analyzer.get_channel_locations()[:, :2]
+        mxy = {}
+        for u in members:
+            xy = loc[ids.index(u), :2]
+            if not np.all(np.isfinite(xy)):
+                ptp = np.ptp(temps[u], axis=0)
+                xy = (ptp[:, None] * cxy).sum(0) / max(ptp.sum(), 1e-12)
+            mxy[u] = xy
+        for k, u in enumerate(members):
+            ax.scatter(*mxy[u], s=40, color=MERGE_COLORS[k % len(MERGE_COLORS)])
+        cy = np.mean([mxy[u][1] for u in members])
+        if np.isfinite(cy):
+            ax.set_ylim(cy - 150, cy + 150)
+    ax.set_xlabel('x (um)'); ax.set_ylabel('y (um)'); ax.set_title('locations', fontsize=8)
+    # spikes per minute per member
+    ax = fig.add_subplot(gs[0, 5])
+    edges = np.arange(0, T_s + 60, 60)
+    for k, u in enumerate(members):
+        ax.plot(edges[:-1] / 60, np.histogram(trains[u], edges)[0], color=MERGE_COLORS[k % len(MERGE_COLORS)], lw=1.2)
+    ax.set_xlabel('time (min)'); ax.set_ylabel('spikes / min'); ax.set_title('activity over the session', fontsize=8)
+    # amplitude over time
+    ax = fig.add_subplot(gs[1, 0:2])
+    for k, u in enumerate(members):
+        if u in amps:
+            a = np.asarray(amps[u])
+            pick = _pick(len(a), 5000, rng)
+            ax.scatter(trains[u][pick], a[pick], s=1, color=MERGE_COLORS[k % len(MERGE_COLORS)], alpha=0.4, lw=0)
+    ax.set_xlabel('time (s)'); ax.set_ylabel('amplitude (uV)'); ax.set_title('amplitude over the session', fontsize=8)
+    # autocorrelograms: each member and pooled
+    ax = fig.add_subplot(gs[1, 2])
+    for k, u in enumerate(members):
+        c, e = _ccg(trains[u], trains[u], exclude_zero=True)
+        ax.step(e[:-1], c, where='post', color=MERGE_COLORS[k % len(MERGE_COLORS)], lw=1)
+    ax.axvspan(-1.5, 1.5, color='0.9', zorder=0)
+    ax.set_title('autocorrelograms (members)', fontsize=8); ax.set_xlabel('lag (ms)')
+    ax = fig.add_subplot(gs[1, 3])
+    pooled = np.sort(np.concatenate(list(trains.values())))
+    c, e = _ccg(pooled, pooled, exclude_zero=True)
+    ax.step(e[:-1], c, where='post', color='k', lw=1)
+    ax.axvspan(-1.5, 1.5, color='0.9', zorder=0)
+    ax.set_title('autocorrelogram (merged)', fontsize=8); ax.set_xlabel('lag (ms)')
+    ax = fig.add_subplot(gs[1, 4])
+    if len(members) >= 2:
+        a_, b_ = members[0], members[1]
+        c, e = _ccg(trains[a_], trains[b_])
+        ax.step(e[:-1], c, where='post', color='k', lw=1)
+        ax.set_title(f'cross-correlogram {a_} x {b_}', fontsize=8)
+    ax.axvspan(-1.5, 1.5, color='0.9', zorder=0)
+    ax.set_xlabel('lag (ms)')
+    ax = fig.add_subplot(gs[1, 5])
+    ax.axis('off')
+    txt = [f'{label[u]}: {len(trains[u])} spikes' for u in members] + list(notes)
+    ax.text(0, 1, '\n'.join(txt), va='top', fontsize=8, family='monospace')
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    if file_name is None:
+        file_name = title.split(':')[0]
+    file_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(file_name).replace('/', '-').replace('+', '_'))[:150]
+    return _save(fig, folder, file_name)

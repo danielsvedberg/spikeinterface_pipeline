@@ -3,7 +3,8 @@
     python -m scripts.curate_subject <recording_files/<subject> folder> [session ...] [--steps=a,b]
 
 --steps runs only the named steps (binary_signals, clean, summary, pynapple, isolate,
-ratio_tests); the subject compendium is built only when isolate runs.
+ratio_tests, and relabel -- the fast-unit cutoff re-applied to the saved tags, no tagging
+tests); the subject compendium is built only when isolate or relabel runs.
 
 Sessions given on the command line are the only ones run AND the only ones pooled into the
 subject compendium; to resume a partly done subject, run the rest, then rebuild the compendium
@@ -23,6 +24,7 @@ the other sessions still run):
   5. per-session compendium plots (ratio_tests)
 Then the pooled DS15 compendium into analysis_files/DS15/compendium.
 """
+import os
 import shutil
 import sys
 import time
@@ -41,14 +43,15 @@ from spikeinterface.exporters import to_pynapple_tsgroup
 from analysis import compendium_plots as cp
 from analysis import plot_psth as pp
 from analysis import session_compendium_plots as scp
-from postprocessing.isolate_single_tagged_units import isolate_single_tagged_units
+from postprocessing.isolate_single_tagged_units import isolate_single_tagged_units, relabel_fast_units
 from preprocessing import parse_nidq as pni
 from scripts import clean_sessions as cs
 from scripts import si_pipeline as sp
 from utils import file_structure as fs
 
 REC = None  # set from the command line
-JOB = dict(n_jobs=-1, chunk_duration='10s', progress_bar=False)
+# SI_N_JOBS caps the workers per process when several sessions run side by side
+JOB = dict(n_jobs=int(os.environ.get('SI_N_JOBS', -1)), chunk_duration='10s', progress_bar=False)
 OLD_PYNAPPLE = ('opto_psth_plots', 'opto_psth_plots_alt', 'opto_tagging', 'psth_plots', 'spikes.npz',
                 'sing_tagged_units.npz', 'singU_metadata.csv')
 
@@ -124,7 +127,9 @@ def pynapple_analysis(base):
         print(f'  {step.__name__}: {(time.time() - t0) / 60:.1f} min', flush=True)
 
 
-STEPS = ('binary_signals', 'clean', 'summary', 'pynapple', 'isolate', 'ratio_tests')
+# relabel: re-apply the fast-unit cutoff (TAGGED_MAX_BASELINE_HZ) to the saved tags, without the
+# tagging tests -- for a cutoff change only
+STEPS = ('binary_signals', 'clean', 'summary', 'pynapple', 'isolate', 'relabel', 'ratio_tests')
 
 
 def run_session(name, only=STEPS):
@@ -135,6 +140,7 @@ def run_session(name, only=STEPS):
              ('summary', lambda: cs.export_summary(base)),
              ('pynapple', lambda: pynapple_analysis(base)),
              ('isolate', lambda: isolate_single_tagged_units(ana, quality_label='bombcell')),
+             ('relabel', lambda: relabel_fast_units(ana)),
              ('ratio_tests', lambda: scp.plot_session(ana))]
     out = {}
     for step, fn in steps:
@@ -156,7 +162,7 @@ def run_session(name, only=STEPS):
             r = {'single_units': len(r['singU_metadata']),
                  'tagged': r['best_tagged']['final_classif'].value_counts().to_dict(),
                  'possible_false_negatives': len(r['poss_fn'])}
-        elif step not in ('binary_signals', 'summary'):
+        elif step not in ('binary_signals', 'summary', 'relabel'):
             r = None
         out[step] = r
         plt.close('all')
@@ -179,12 +185,13 @@ if __name__ == '__main__':
                                   and (fs.category_path(d, fs.SORTING_ROOT) / 'analyzer').exists())
     print(f'=== {REC.name}: sessions {sessions}, steps {only}', flush=True)
     results = {s: run_session(s, only) for s in sessions}
-    if 'isolate' not in only:
+    tag_step = 'isolate' if 'isolate' in only else 'relabel' if 'relabel' in only else None
+    if tag_step is None:
         for s, r in results.items():
             print(s, r)
         sys.exit(0)
     # the pooled compendium reads sing_tagged_units.npz, so every session whose isolate step ran
-    good = [s for s, r in results.items() if 'isolate' in r and not str(r['isolate']).startswith('FAILED')]
+    good = [s for s, r in results.items() if tag_step in r and not str(r[tag_step]).startswith('FAILED')]
     print(f'=== pooled {REC.name} compendium over {good}', flush=True)
     try:
         # a session that cannot be categorised (no licks, no rewards: DS45_20260821) is left out

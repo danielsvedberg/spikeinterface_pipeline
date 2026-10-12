@@ -37,7 +37,7 @@ from tests import artifact_ringing as ring
 
 matplotlib.use('Agg')
 
-DEFAULT_FOLDER = Path(r"D:\experiment_data\recording_files\DS45\DS45_20260811")
+DEFAULT_FOLDER = Path(r"C:\experiment_data\recording_files\DS45\DS45_20260811")
 # the opto averages are read at two widths: +/-5 ms is the artifact itself and the
 # interpolated span; +/-50 ms is where bandpass ringing off an unremoved transient shows
 OPTO_WINDOWS_MS = (5.0, 50.0)

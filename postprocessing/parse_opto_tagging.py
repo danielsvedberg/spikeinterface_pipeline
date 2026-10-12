@@ -561,8 +561,37 @@ def classify_opsin_response(ch_sig, c2_sig, ch_gt_c2):
     return np.nan
 
 
+# Tagging trusts only what happens while the light is on, and not its first LIGHT_ARTIFACT_MS:
+# the light's onset can still leave an artifact the preprocessing did not remove (DS13: pile-ups
+# 0.5-1.0 ms after onset in 69-87 units), and activity after the light goes off is network or
+# rebound, not the opsin (user decision, 2026-10-05). The windows are measured from each
+# session's pulses (DS13 0822/0824 use 10-ms pulses, everything else 100 ms): TTFS
+# (LIGHT_ARTIFACT_MS, pulse - LIGHT_ARTIFACT_MS] after onset (the offset can leave an artifact
+# too), the firing test (LIGHT_ARTIFACT_MS, pulse].
+LIGHT_ARTIFACT_MS = 1.0
+
+
+def pulse_duration_s(bs, opsin):
+    """Median light-pulse duration (s) of an opsin, from its paired on/off events; NaN if none."""
+    import re
+    events = dict(zip(bs.metadata['event'], bs.metadata.index))
+    durs = []
+    for name, idx in events.items():
+        m = re.fullmatch(rf'{opsin}_on_(\d+)', str(name))
+        off_idx = events.get(f'{opsin}_off_{m.group(1)}') if m else None
+        if off_idx is None:
+            continue
+        on = np.asarray(bs[idx].t, float)
+        off = np.asarray(bs[off_idx].t, float)
+        nxt = np.searchsorted(off, on)
+        ok = nxt < len(off)
+        durs.append(off[nxt[ok]] - on[ok])
+    d = np.concatenate(durs) if durs else np.array([])
+    return float(np.median(d)) if d.size else np.nan
+
+
 def test_stim_firing(ephys_data, bs, opsins=None, response_window_ms=None, peak_bin_ms=10.0,
-                     skip_ms=1.0, alpha=0.05, save_folder=None):
+                     skip_ms=LIGHT_ARTIFACT_MS, alpha=0.05, save_folder=None):
     """
     For each unit and opsin, test whether the light pulses drive firing, and label the cell
     type from which opsins do (classify_opsin_response).
@@ -649,7 +678,7 @@ def test_stim_firing(ephys_data, bs, opsins=None, response_window_ms=None, peak_
     opsin_info = {}
     events = dict(zip(bs_metadata['event'], bs_metadata.index))
     for opsin in opsins:
-        onsets, powers, durations = [], [], []
+        onsets, powers = [], []
         for name, idx in events.items():
             m = re.fullmatch(rf'{opsin}_on_(\d+)', str(name))
             if m is None:
@@ -657,12 +686,6 @@ def test_stim_firing(ephys_data, bs, opsins=None, response_window_ms=None, peak_
             on = _ts(idx)
             onsets.append(on)
             powers.append(np.full(len(on), float(m.group(1))))
-            off_idx = events.get(f'{opsin}_off_{m.group(1)}')
-            if off_idx is not None and len(on):
-                off = _ts(off_idx)
-                nxt = np.searchsorted(off, on)
-                ok = nxt < len(off)
-                durations.append(off[nxt[ok]] - on[ok])
         if not onsets or not np.concatenate(onsets).size:
             continue
         on, pw = np.concatenate(onsets), np.concatenate(powers)
@@ -670,11 +693,11 @@ def test_stim_firing(ephys_data, bs, opsins=None, response_window_ms=None, peak_
         if response_window_ms is not None:
             lo, hi = response_window_ms[0] / 1000.0, response_window_ms[1] / 1000.0
         else:
-            dur = np.concatenate(durations) if durations else np.array([])
-            if not dur.size:
+            hi = pulse_duration_s(bs, opsin)
+            if not np.isfinite(hi):
                 raise ValueError(f'no {opsin}_off events to take the pulse duration from; '
                                  'pass response_window_ms')
-            lo, hi = skip_s, float(np.median(dur))
+            lo = skip_s
         opsin_info[opsin] = {'onsets': on[order], 'powers': pw[order], 'lo': lo, 'hi': hi}
 
     def _paired_greater(a, b):
@@ -958,7 +981,8 @@ def plot_stim_firing_bars(ephys_data, bs, save_folder=None, alpha=0.05,
             plt.show()
 
 
-def plot_time_to_first_spike_distribution(ephys_data, bs, save_folder=None, max_latency_ms=100, alpha=0.05):
+def plot_time_to_first_spike_distribution(ephys_data, bs, save_folder=None, max_latency_ms=None,
+                                          alpha=0.05, artifact_ms=LIGHT_ARTIFACT_MS):
     """
     Plot the distribution of time to first spike (TTFS) relative to optogenetic stimulus onset
     for each neuron and opsin. The TTFS is calculated as the latency between the stimulus
@@ -972,8 +996,14 @@ def plot_time_to_first_spike_distribution(ephys_data, bs, save_folder=None, max_
         Binary-signals object with ``.metadata`` and ``bs[idx]`` access.
     save_folder : Path or None
         If provided, a summary PNG is saved to ``save_folder / ttfs_summary.png``.
-    max_latency_ms : float
-        Maximum latency for considering a spike (default 100 ms).
+    max_latency_ms : float or None
+        Pulse length assumed. None (default): the opsin's measured pulse duration
+        (pulse_duration_s), so only spikes while the light is on count; a number caps it.
+    artifact_ms : float
+        Spikes within this long after onset and before offset are ignored (light artifacts;
+        LIGHT_ARTIFACT_MS): the window is (artifact_ms, pulse - artifact_ms] after onset. The
+        pre-stimulus control is the same span before onset, latencies measured from its
+        start, so both are on the same footing.
     alpha : float
         Significance threshold used for ``cell_type`` labelling (default 0.05).
 
@@ -1018,6 +1048,7 @@ def plot_time_to_first_spike_distribution(ephys_data, bs, save_folder=None, max_
     bs_metadata = bs.metadata
 
     records = []
+    windows_ms = {}
     # for each opsin, find all on events and extract spike times in the post-stimulus window
     for opsin in ['chrimson', 'chr2']:
         # find rows corresponding to opsin on events
@@ -1034,6 +1065,20 @@ def plot_time_to_first_spike_distribution(ephys_data, bs, save_folder=None, max_
         events_idx = events_idx.copy()
         events_idx['power'] = events_idx['event'].apply(_extract_power)
 
+        # the window: (artifact_ms, pulse duration - artifact_ms] after onset -- the light on,
+        # less a millisecond after it turns on and before it turns off (user, 2026-10-05)
+        pulse_ms = pulse_duration_s(bs, opsin) * 1000.0
+        if not np.isfinite(pulse_ms):
+            if max_latency_ms is None:
+                raise ValueError(f'no {opsin}_off events to take the pulse duration from; '
+                                 'pass max_latency_ms')
+            pulse_ms = float(max_latency_ms)
+        elif max_latency_ms is not None:
+            pulse_ms = min(pulse_ms, float(max_latency_ms))
+        win_ms = pulse_ms - float(artifact_ms)
+        windows_ms[opsin] = win_ms
+        win_s, art_s = win_ms / 1000.0, float(artifact_ms) / 1000.0
+
         for idx, row in events_idx.iterrows():
             ts_obj = bs[idx]
             onsets = ts_obj.t if hasattr(ts_obj, 't') else ts_obj.index
@@ -1043,25 +1088,24 @@ def plot_time_to_first_spike_distribution(ephys_data, bs, save_folder=None, max_
                     spike_times = ephys_data[unit].index
                     # relative spike times (s)
                     rel = spike_times - onset
-                    max_lat_s = float(max_latency_ms) / 1000.0
-                    mask_spikes = (rel > 0) & (rel <= max_lat_s)
+                    mask_spikes = (rel > art_s) & (rel <= win_s)
                     if np.any(mask_spikes):
                         latency_s = np.min(rel[mask_spikes])
                         ttfs_ms = float(latency_s * 1000.0)
                         responded = True
                     else:
-                        ttfs_ms = float(max_latency_ms)
+                        ttfs_ms = win_ms
                         responded = False
-                        
-                    # Pre-stimulus control: first spike in the 100 ms window before onset.
-                    # Trials with no spike are right-censored at max_latency_ms.
-                    rel_null = spike_times - (onset - float(max_latency_ms) / 1000.0)
-                    mask_null = (rel_null > 0) & (rel_null <= float(max_latency_ms) / 1000.0)
+
+                    # Pre-stimulus control: the same span, its window ending artifact_ms
+                    # before onset. No spike: right-censored at win_ms.
+                    rel_null = spike_times - (onset - win_s - art_s)
+                    mask_null = (rel_null > art_s) & (rel_null <= win_s)
                     prestim_responded = bool(np.any(mask_null))
                     if prestim_responded:
                         prestim_ttfs_ms = float(np.min(rel_null[mask_null]) * 1000.0)
                     else:
-                        prestim_ttfs_ms = float(max_latency_ms)
+                        prestim_ttfs_ms = win_ms
 
                     records.append({
                         'unit': unit,
@@ -1258,7 +1302,7 @@ def plot_time_to_first_spike_distribution(ephys_data, bs, save_folder=None, max_
                 else:
                     ax.set_title(f'{op} @ {pow_label} \u00b5W (No Data)', fontsize=8)
 
-                ax.set_xlim(0, max_latency_ms)
+                ax.set_xlim(0, max(windows_ms.values()))
                 ax.set_ylim(0, 1)
                 if row_idx == n_powers - 1:
                     ax.set_xlabel('Time to first spike (ms)')

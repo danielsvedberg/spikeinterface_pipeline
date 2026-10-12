@@ -62,7 +62,14 @@ R_MS = 1.5
 # REDUNDANT: the sorter's duplicate units (see auto_merge)
 REDUNDANT = 'redundant'
 DRIFT = 'drift'
-MERGE_PRESETS = ('feature_neighbors', 'similarity_correlograms', DRIFT, REDUNDANT)
+# peeled outlier clusters to the neighbour they match (greedy_cleaning.outlier_merge_groups)
+OUTLIERS = 'outliers'
+# pieces of one neuron by the cross-refractory dip or mixture clusters, merged only when the merge
+# raises presence without costing SNR (postprocessing.pair_merge; user, 2026-10-12)
+PAIR_MERGE = 'pair_merge'
+MERGE_PRESETS = (OUTLIERS, 'feature_neighbors', 'similarity_correlograms', DRIFT, PAIR_MERGE, REDUNDANT)
+# step 6b: spikes detected by two units deleted from one of them (pair_merge.double_detections)
+DELETE_DOUBLE_DETECTIONS = True
 # DRIFT: one neuron the sorter (or a split) left as two units because drift changed its
 # waveform, so their templates miss MERGE_MIN_SIMILARITY. Neighbours within
 # DRIFT_MAX_DISTANCE_UM whose trains are mutually refractory (sos.mutually_refractory) and
@@ -70,7 +77,21 @@ MERGE_PRESETS = ('feature_neighbors', 'similarity_correlograms', DRIFT, REDUNDAN
 # 6 um apart at cosine 0.85-0.89. The similarity floor keeps out pairs that are
 # refractory to each other but look nothing alike (DS48_20260922 905/913, cosine -0.39).
 DRIFT_MAX_DISTANCE_UM = 40.0
-DRIFT_MIN_SIMILARITY = 0.5
+# 2026-10-06 (user agreed): a drift merge also needs the two pieces to take turns in time --
+# _time_overlap <= DRIFT_MAX_TIME_OVERLAP -- and template similarity >= DRIFT_MIN_SIMILARITY
+# where they meet (was 0.5). DS15_20260702 unit 1292 had joined KS 496 and 487/2: 0 of 26
+# expected coincidences (the big unit masking the small one's spikes), similarity ~0.6, but
+# both active all session (time overlap 0.73) -- two neurons. The pieces of DS2_20260505 KS 605
+# overlap 0.03-0.05 at similarities 0.85-0.89.
+DRIFT_MIN_SIMILARITY = 0.8
+DRIFT_MAX_TIME_OVERLAP = 0.3
+# and (2026-10-06, after DS15_20260702 KS 62 + 63: 82 spikes at ~3x the amplitude, fired in
+# brief episodes *inside* 63's active period, similarity 0.92 because cosine ignores scale):
+# the templates' peak amplitudes within DRIFT_MAX_AMPLITUDE_RATIO of each other, and a real
+# handover -- at most DRIFT_MAX_INSIDE of either piece's spikes inside the other's active span
+# (its 5th-95th percentile spike times). KS 605's pieces: ~0.40 and ~0.14.
+DRIFT_MAX_AMPLITUDE_RATIO = 1.5
+DRIFT_MAX_INSIDE = 0.5
 # spikeinterface.curation.find_redundant_units: a pair is redundant when more than
 # duplicate_threshold of one unit's spikes fall within delta_time (ms) of the other's
 # (Kilosort4 emits such pairs, some offset by a fixed few samples -- a time-shifted copy of
@@ -88,8 +109,44 @@ MERGE_MIN_SIMILARITY = 0.9
 # interval (DS48_20260922 unit 487), and units with 1-3 violations and bounds over 5-10%
 # looked well isolated on review (DS48, 2026-09-30), as did those with bounds of 5-10%
 RP_MAX_CONTAMINATION, RP_CONFIDENCE, RP_MAX_FREE_VIOLATIONS = 0.10, 0.95, 3
-# a split half that is itself two clusters is split again, to this many levels
-SPLIT_MAX_DEPTH = 2
+# The refractory criterion counts spontaneous spikes only: light can drive an otherwise quiet,
+# well-isolated SPN to near 1 kHz, ISIs inside the refractory period, so evoked spikes are no
+# evidence of contamination (user decision, 2026-10-08). Left out: every light pulse and this
+# long after it. The labels only: the cleaning's merge veto still counts every spike.
+RP_STIM_PAD_S = 0.1
+# artifact spikes (artifact_spikes): more than ARTIFACT_DEPTH_FACTOR times as deep as the unit's
+# median spike on its peak channel and at most ARTIFACT_WIDTH_FACTOR as wide -- user, 2026-10-06:
+# "I would rather have the algorithm take out these rare artifacts"
+ARTIFACT_DEPTH_FACTOR, ARTIFACT_WIDTH_FACTOR = 2.0, 0.5
+# greedy cleaning (user, 2026-10-06): a unit is split again and again while it still holds two
+# clusters (up to SPLIT_MAX_DEPTH levels, a safety cap), and its outliers are peeled off round
+# after round until none are left (up to PEEL_MAX_ROUNDS, and never more than
+# sos.MAX_OUTLIER_FRAC of the unit in total). Peeled outliers are not thrown away: they become
+# clusters of their own ('<unit>/out<k>'), which can merge into a neighbour with the same
+# waveform (the OUTLIERS merge preset) or stay as units of their own.
+SPLIT_MAX_DEPTH = 6
+PEEL_MAX_ROUNDS = 5
+# an outlier cluster merges into the neighbour (within DRIFT_MAX_DISTANCE_UM, not its own
+# parent, not noise) whose template it matches best, at template cosine >= MERGE_MIN_SIMILARITY,
+# with no cross spikes in (W, R] and the merged unit refractory; smaller clusters stay as they are
+OUTLIER_MERGE_MIN_SPIKES = 20
+# an outlier cluster that merges into no unit was kept as a unit of its own only with at least
+# this many spikes (user, 2026-10-06): DS15 kept 424 small ones otherwise, almost all MUA, and
+# as neighbours of the units they were peeled from they lowered those units' PCA isolation
+# metrics. Since 2026-10-12 (user) a smaller one is kept too when its waveform passes bombcell's
+# noise (shape) criteria, or when it has fewer than OUTLIER_EVAL_MIN_SPIKES spikes, too few for its
+# template's shape to be judged; it is then MUA at least (bombcell's num_spikes minimum), and
+# available to the post-cleaning merges
+OUTLIER_KEEP_MIN_SPIKES = 1000
+OUTLIER_EVAL_MIN_SPIKES = 50
+# light artifacts: a spike within ARTIFACT_EDGE_MS of a light onset or offset that is more than
+# ARTIFACT_DEPTH_FACTOR times as deep as the unit's template and at most ARTIFACT_WIDTH_FACTOR as
+# wide. DS15_20260702: the transients sit 0.3-0.45 ms after light onset. Split off as
+# '<unit>/art' clusters and dropped only at the very end (user, 2026-10-06).
+ARTIFACT_EDGE_MS = 1.0
+# ...and only in units whose template trough is at least this deep: in a near-flat template
+# (DS15_20260702 units 236, 533: -4.7, -1.0 uV) any spike is 'twice as deep'
+ARTIFACT_MIN_TEMPLATE_UV = 20.0
 
 
 # bombcell noise criteria left out. peak_to_trough_duration is measured from the trough to the
@@ -103,14 +160,31 @@ NOISE_EXCLUDED_METRICS = ('peak_to_trough_duration',)
 # a 3-5 bit wide background, so the MAD takes values 4.5 / 9.0 / 13.5 uV), and units failing only
 # SNR in [4, 5) looked well isolated on review (DS2, user decision, 2026-10-02)
 MUA_SNR_MIN = 4
+# presence-ratio minimum lowered from bombcell's 0.7: SPNs are quiet, and a sparse unit that fires
+# in short episodes leaves many one-minute bins empty without being absent. DS15_20260702 heavy
+# unit 26, a clean iSPN (370 spikes, 0.13 Hz, 0 violations, 195 orange-evoked spikes at 1 mW),
+# was MUA at 0.688. Over DS15 0701-0703 the units failing presence ratio alone between 0.6 and
+# 0.7 all fired ~0.1 Hz; those between 0.5 and 0.6 fired 0.3-3.6 Hz (partial presence, not
+# quietness) (user decision, 2026-10-07)
+MUA_PRESENCE_MIN = 0.6
+# bombcell's spatial-decay noise range (exp_decay, 1/um of amplitude fall-off across channels)
+# widened from (0.01, 0.1): on the NP2014 probes it alone dropped 112 units over the 17 heavy
+# sessions, among them well-isolated ones on both sides -- DS2_20260505 KS 17 (0.0072: SNR 5.4,
+# -70 uV, presence 0.97, 0 violations) and KS 403 (0.0084, a dSPN), and four at 0.101-0.12
+# (DS45_20260814 KS 262, DS45_20260820 KS 406, ...) (user decision, 2026-10-12)
+EXP_DECAY_RANGE = (0.005, 0.15)
 
 
 def default_thresholds():
-    """bombcell's default thresholds without the excluded noise criteria, with the SNR minimum lowered."""
+    """bombcell's default thresholds without the excluded noise criteria, with the SNR and
+    presence-ratio minimums lowered."""
     th = copy.deepcopy(sic.bombcell_get_default_thresholds())
     for m in NOISE_EXCLUDED_METRICS:
         th['noise'].pop(m, None)
     th['mua']['snr']['greater'] = MUA_SNR_MIN
+    th['mua']['presence_ratio']['greater'] = MUA_PRESENCE_MIN
+    if 'exp_decay' in th['noise']:
+        th['noise']['exp_decay'] = {'greater': EXP_DECAY_RANGE[0], 'less': EXP_DECAY_RANGE[1]}
     return th
 
 
@@ -370,8 +444,8 @@ def _pair_drops(analyzer, scores, t_c, method, exclude=None, unit_ids=None, pref
     exclude  : {unit: indices already being dropped}; those spikes are taken out before
                the pairs are found, so an outlier is not counted twice and its removal
                can close no pair it was part of.
-    unit_ids : resolve only these units (all by default). In template mode every unit
-               resolved must have scores.
+    unit_ids : resolve only these units (all by default). In template mode a unit with no
+               scores is resolved by order.
     prefer   : {unit: bool per spike}; in a pair with one preferred spike, that spike is
                kept whatever the other test says (the redundant merges' reference copy)
     """
@@ -384,9 +458,8 @@ def _pair_drops(analyzer, scores, t_c, method, exclude=None, unit_ids=None, pref
         if exclude and u in exclude and len(exclude[u]):
             idx = np.setdiff1d(idx, exclude[u])
         bad = None
-        if method == 'template':
-            if u not in scores:
-                raise KeyError(f'unit {u} has no spike scores to resolve its pairs by')
+        # clusters too small to score (greedy_cleaning.MIN_SCORE_SPIKES) are resolved by order
+        if method == 'template' and u in scores:
             bad = _badness(scores[u])[idx]
         if prefer and u in prefer:
             # badness is 1 - a correlation, within [0, 2]: lowering preferred spikes by 2
@@ -615,29 +688,77 @@ def _rp_fails(train, n_samples, t_c, t_r):
     return bool(lo > RP_MAX_CONTAMINATION and n_v > RP_MAX_FREE_VIOLATIONS), n_v, lo
 
 
-def _bombcell_with_rp_minimum(analyzer, thresholds=None):
+def spontaneous_rp(analyzer, stim_intervals, pad_s=RP_STIM_PAD_S):
+    """Each unit's refractory statistics on its spikes outside light stimulation.
+
+    Spikes inside a light pulse or up to pad_s after it are left out, and the duration the
+    contamination is scaled by is the session minus those periods. Violations are pairs in
+    (t_c, t_r] of the quality_metrics extension's censored and refractory periods, as in
+    _rp_fails. Returns a frame indexed by unit: rp_violations, num_spikes, n_samples,
+    rp_contamination (Llobet), rp_contamination_lo (its RP_CONFIDENCE lower bound)."""
+    from spikeinterface.metrics.quality.misc_metrics import _compute_rp_contamination_one_unit
+    p = analyzer.get_extension('quality_metrics').params['metric_params']['rp_violation']
+    fs = analyzer.sampling_frequency
+    t_c = int(round(p['censored_period_ms'] * fs * 1e-3))
+    t_r = int(round(p['refractory_period_ms'] * fs * 1e-3))
+    iv = np.asarray(stim_intervals, float).reshape(-1, 2)
+    iv = iv[np.argsort(iv[:, 0])] + np.array([0.0, pad_s]) if len(iv) else iv
+    merged = []
+    for lo, hi in iv:  # padded pulses can overlap: merge them so no time is counted twice
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    iv = (np.asarray(merged) * fs).round().astype(np.int64) if merged else np.zeros((0, 2), np.int64)
+    n = analyzer.get_total_samples() - int((iv[:, 1] - iv[:, 0]).sum())
+    rows = {}
+    for u in analyzer.unit_ids:
+        tr = np.sort(analyzer.sorting.get_unit_spike_train(u))
+        if len(iv):
+            j = np.searchsorted(iv[:, 0], tr, side='right') - 1
+            tr = tr[~((j >= 0) & (tr <= iv[np.clip(j, 0, None), 1]))]
+        idx = np.arange(tr.size)
+        n_v = int(np.sum(np.searchsorted(tr, tr + t_r, 'right') - idx - 1)
+                  - np.sum(np.searchsorted(tr, tr + t_c, 'right') - idx - 1))
+        rows[u] = {'rp_violations': n_v, 'num_spikes': tr.size, 'n_samples': n,
+                   'rp_contamination': (_compute_rp_contamination_one_unit(n_v, tr.size, n, t_c, t_r)
+                                        if tr.size else np.nan),
+                   'rp_contamination_lo': _rp_lower_bound(n_v, tr.size, n, t_c, t_r)}
+    return pd.DataFrame.from_dict(rows, orient='index')
+
+
+def _bombcell_with_rp_minimum(analyzer, thresholds=None, stim_intervals=None):
     """Bombcell labels, with its refractory criterion applied to a confidence bound.
 
     Bombcell runs with every threshold but rp_contamination; the refractory criterion
     is then applied separately, and demotes a unit (good -> mua, non_soma_good ->
     non_soma_mua) when the RP_CONFIDENCE lower bound of its contamination is over
     RP_MAX_CONTAMINATION (see rp_contamination_lower_bound) and it has more than
-    RP_MAX_FREE_VIOLATIONS violations. The labels frame gains
-    rp_violations, rp_contamination, rp_contamination_lo, rp_counted (bound over the
-    limit) and rp_demoted for the audit.
+    RP_MAX_FREE_VIOLATIONS violations. With stim_intervals ((n, 2) s of every light pulse)
+    the criterion is computed on spontaneous spikes only (spontaneous_rp; see RP_STIM_PAD_S).
+    The labels frame gains rp_violations, rp_contamination, rp_contamination_lo (those the
+    criterion used), rp_counted (bound over the limit), rp_demoted, and, with stim_intervals,
+    rp_violations_all (every spike) and rp_spikes_counted, for the audit.
     """
     th = copy.deepcopy(thresholds or default_thresholds())
     th.get('mua', {}).pop('rp_contamination', None)
     labels = sic.bombcell_label_units(analyzer, thresholds=th, label_non_somatic=True,
                                       split_non_somatic_good_mua=True)
     qm = analyzer.get_extension('quality_metrics').get_data().loc[labels.index]
-    lo = rp_contamination_lower_bound(analyzer).loc[labels.index]
-    counted = (lo > RP_MAX_CONTAMINATION) & (qm['rp_violations'] > RP_MAX_FREE_VIOLATIONS)
+    extra = {}
+    if stim_intervals is not None:
+        sp = spontaneous_rp(analyzer, stim_intervals).loc[labels.index]
+        nv, c, lo = sp['rp_violations'], sp['rp_contamination'], sp['rp_contamination_lo']
+        extra = {'rp_violations_all': qm['rp_violations'], 'rp_spikes_counted': sp['num_spikes']}
+    else:
+        nv, c = qm['rp_violations'], qm['rp_contamination']
+        lo = rp_contamination_lower_bound(analyzer).loc[labels.index]
+    counted = (lo > RP_MAX_CONTAMINATION) & (nv > RP_MAX_FREE_VIOLATIONS)
     demote = counted & labels['bombcell_label'].isin(['good', 'non_soma_good'])
     labels.loc[demote, 'bombcell_label'] = labels.loc[demote, 'bombcell_label'].map(
         {'good': 'mua', 'non_soma_good': 'non_soma_mua'})
-    return labels.assign(rp_violations=qm['rp_violations'], rp_contamination=qm['rp_contamination'],
-                         rp_contamination_lo=lo, rp_counted=counted, rp_demoted=demote)
+    return labels.assign(rp_violations=nv, rp_contamination=c, rp_contamination_lo=lo,
+                         rp_counted=counted, rp_demoted=demote, **extra)
 
 
 def _template_cosine(analyzer, u1, u2, max_shift=0):
@@ -715,23 +836,70 @@ def _merged_rp_veto(analyzer, group, w_ms=W_MS, r_ms=R_MS):
     return ''
 
 
+def _time_overlap(ta, tb, bin_s=sos.SPLIT_BIN_S):
+    """How much two trains' time profiles coincide: the sum over bin_s bins of the smaller of
+    the two units' shares of their spikes in the bin. 0 = never active in the same minutes
+    (one hands over to the other), 1 = the same time course."""
+    end = max(float(np.max(ta)) if len(ta) else 0.0, float(np.max(tb)) if len(tb) else 0.0)
+    if not len(ta) or not len(tb):
+        return 0.0
+    edges = np.arange(0.0, end + bin_s, bin_s)
+    ha, hb = np.histogram(ta, edges)[0], np.histogram(tb, edges)[0]
+    return float(np.minimum(ha / ha.sum(), hb / hb.sum()).sum())
+
+
+def _share_inside(ta, tb):
+    """Share of ta's spikes inside tb's active span (its 5th-95th percentile spike times)."""
+    if len(ta) == 0 or len(tb) < 2:
+        return 0.0
+    lo, hi = np.percentile(tb, [5, 95])
+    return float(np.mean((ta >= lo) & (ta <= hi)))
+
+
+def _amplitude_ratio(analyzer, a, b):
+    """Larger over smaller peak |amplitude| of two units' templates (>= 1)."""
+    t = analyzer.get_extension('templates')
+    pa, pb = np.abs(t.get_unit_template(a)).max(), np.abs(t.get_unit_template(b)).max()
+    return float(max(pa, pb) / max(min(pa, pb), 1e-9))
+
+
+def _refractory_to_each_other(ta, tb):
+    """(ok, note): mutually refractory where testable (sos.mutually_refractory), else -- too
+    little time active together -- no more cross coincidences than the labels' floor."""
+    obs, exp = sos.coincidences(ta, tb)
+    if exp >= sos.MUTUAL_MIN_EXPECTED:
+        return sos.mutually_refractory(obs, exp), f'{obs} of {exp:.1f} expected coincidences'
+    return obs <= RP_MAX_FREE_VIOLATIONS, f'{obs} coincidences within {sos.REFRACTORY_MS:g} ms'
+
+
 def _drift_pair_test(analyzer, trains_s, a, b):
-    """(is a drift pair, note) for two units: mutually refractory, still alike, and
-    refractory as one unit."""
-    obs, exp = sos.coincidences(trains_s[a], trains_s[b])
+    """(is a drift pair, note) for two neighbouring units: they take turns in time, look alike
+    where they meet, never fire within a refractory period of each other, and are refractory
+    as one unit."""
+    ov = _time_overlap(trains_s[a], trains_s[b])
+    if ov > DRIFT_MAX_TIME_OVERLAP:
+        return False, f'{a}-{b}: time overlap {ov:.2f} > {DRIFT_MAX_TIME_OVERLAP:g}'
+    inside = max(_share_inside(trains_s[a], trains_s[b]), _share_inside(trains_s[b], trains_s[a]))
+    if inside > DRIFT_MAX_INSIDE:
+        return False, f'{a}-{b}: {inside:.2f} of a piece inside the active span of the other > {DRIFT_MAX_INSIDE:g}'
+    ratio = _amplitude_ratio(analyzer, a, b)
+    if ratio > DRIFT_MAX_AMPLITUDE_RATIO:
+        return False, f'{a}-{b}: amplitude ratio {ratio:.2f} > {DRIFT_MAX_AMPLITUDE_RATIO:g}'
     s = _template_cosine(analyzer, a, b)
     if s < DRIFT_MIN_SIMILARITY:
         return False, f'template similarity {a}-{b} {s:.2f} < {DRIFT_MIN_SIMILARITY:g}'
-    if not sos.mutually_refractory(obs, exp):
-        return False, f'{a}-{b}: {obs} of {exp:.1f} expected coincidences: not mutually refractory'
+    ok, note = _refractory_to_each_other(trains_s[a], trains_s[b])
+    if not ok:
+        return False, f'{a}-{b}: {note}'
     why = _merged_rp_veto(analyzer, [a, b])
     if why:
         return False, why
-    return True, f'{a}-{b}: {obs} of {exp:.0f} expected coincidences, similarity {s:.2f}'
+    return True, (f'{a}-{b}: time overlap {ov:.2f}, inside {inside:.2f}, amplitude ratio '
+                  f'{ratio:.2f}, similarity {s:.2f}, {note}')
 
 
-def _drift_pairs(analyzer):
-    """Candidate drift pairs: neighbours that pass _drift_pair_test."""
+def _drift_pairs(analyzer, exclude=()):
+    """Candidate drift pairs: neighbours that pass _drift_pair_test (excluded units left out)."""
     fs = analyzer.sampling_frequency
     ids = list(analyzer.unit_ids)
     loc = analyzer.get_extension('unit_locations').get_data()[:, :2]
@@ -739,34 +907,65 @@ def _drift_pairs(analyzer):
     pairs = []
     for i in range(len(ids)):
         for j in range(i + 1, len(ids)):
+            if ids[i] in exclude or ids[j] in exclude:
+                continue
             if np.linalg.norm(loc[i] - loc[j]) <= DRIFT_MAX_DISTANCE_UM:
                 if _drift_pair_test(analyzer, trains_s, ids[i], ids[j])[0]:
                     pairs.append((ids[i], ids[j]))
     return pairs, trains_s
 
 
-def _drift_merge_veto(analyzer, group, trains_s):
-    """Why a drift group fails, or ''. Every pair must look alike; a pair active together
-    long enough to test must be mutually refractory, and one that is not (pieces from
-    either end of a drift, joined through a middle one) may have no more cross-unit
-    coincidences than the refractory floor of the labels."""
+def _drift_merge_veto(analyzer, group, trains_s, edges):
+    """Why a drift group fails, or ''. Its directly linked pieces (edges: the pairs that
+    passed _drift_pair_test) were already checked. The others -- either end of a drift
+    chain, joined through middle pieces -- may look different after the drift (DS2_20260505
+    KS 605: ends at similarity 0.67), so they only have to stay refractory to each other; and
+    the whole group must be refractory as one unit."""
     for i in range(len(group)):
         for j in range(i + 1, len(group)):
             a, b = group[i], group[j]
-            s = _template_cosine(analyzer, a, b)
-            if s < DRIFT_MIN_SIMILARITY:
-                return f'template similarity {a}-{b} {s:.2f} < {DRIFT_MIN_SIMILARITY:g}'
-            obs, exp = sos.coincidences(trains_s[a], trains_s[b])
-            if exp >= sos.MUTUAL_MIN_EXPECTED:
-                if not sos.mutually_refractory(obs, exp):
-                    return f'{a}-{b}: {obs} of {exp:.1f} expected coincidences'
-            elif obs > RP_MAX_FREE_VIOLATIONS:
-                return f'{a}-{b}: {obs} coincidences within {sos.REFRACTORY_MS:g} ms'
+            if frozenset((a, b)) in edges:
+                continue
+            ok, note = _refractory_to_each_other(trains_s[a], trains_s[b])
+            if not ok:
+                return f'{a}-{b}: {note}'
     return _merged_rp_veto(analyzer, group)
 
 
-def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, **job_kwargs):
+def _group_notes(analyzer, group, names, w_ms=W_MS, r_ms=R_MS):
+    """The numbers a merge report prints: each pair's template similarity, time overlap and
+    cross spikes within (W, R], and the pooled train's refractory violations."""
+    fs = analyzer.sampling_frequency
+    t_c, t_r = _t_c(fs, w_ms), _t_c(fs, r_ms)
+    trains = _unit_samples(analyzer)
+    out = []
+    for i in range(len(group)):
+        for j in range(i + 1, len(group)):
+            a, b = group[i], group[j]
+            out.append(f'{names.get(a, a)} x {names.get(b, b)}: similarity '
+                       f'{_template_cosine(analyzer, a, b):.2f}, time overlap '
+                       f'{_time_overlap(trains[a] / fs, trains[b] / fs):.2f}, '
+                       f'{_cross_violations(trains[a], trains[b], t_c, t_r)} cross spikes in '
+                       f'({w_ms:g}, {r_ms:g}] ms')
+    _, n_v, lo = _rp_fails(np.concatenate([trains[u] for u in group]),
+                           analyzer.get_total_samples(), t_c, t_r)
+    out.append(f'merged: {n_v} violations, contamination lower bound {lo:.2f}')
+    return out
+
+
+def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, exclude=(), names=None,
+               kinds=None, plot_folder=None, stim_intervals=None, **job_kwargs):
     """Soft merges, one preset at a time. Returns (analyzer, merge table).
+
+    exclude     : units that take part in no merge (noise, artifacts)
+    names       : {unit: name} for the table and the figures; merged units are added to it
+    kinds       : {unit: 'unit' | 'out' | ...} from greedy_cleaning; the OUTLIERS preset merges
+                  'out' clusters into units, and the other presets leave 'out' clusters alone.
+                  The OUTLIERS table of every outlier cluster's fate is in the merge table's
+                  attrs['outlier_clusters'].
+    plot_folder : a merge report (cleaning_plots.plot_merge_report) per merge, drawn before it
+    stim_intervals : light pulses (s); the PAIR_MERGE preset judges spontaneous spikes only. Its
+                  evidence for every candidate pair is in the merge table's attrs['pair_merge'].
 
     compute_merge_unit_groups takes `preset` (singular); a misspelled keyword falls into
     its **job_kwargs and is silently ignored, which is how the pipeline's merges once
@@ -779,18 +978,40 @@ def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, **job_kwar
     cols = ['preset', 'group', 'members', 'new_unit_id', 'merged', 'reference', 'note']
     rows = []
     balance = _default_step_params['quality_score']['firing_contamination_balance']
+    names = names if names is not None else {}
+    kinds = kinds if kinds is not None else {}
+    exclude = set(exclude)
+    outlier_table = None
+    pair_merge_table = None
     for preset in presets:
         max_shift = 0
         trains_s = None
-        if preset == DRIFT:
-            pairs, trains_s = _drift_pairs(analyzer)
+        notes = {}
+        # outlier clusters merge only through their own preset
+        skip = exclude | {u for u in analyzer.unit_ids if kinds.get(u) == 'out'}
+        if preset == OUTLIERS:
+            from postprocessing import greedy_cleaning as gc
+            groups, notes, outlier_table = gc.outlier_merge_groups(analyzer, names, kinds, exclude,
+                                                                   w_ms, r_ms)
+            pairs = []
+        elif preset == DRIFT:
+            pairs, trains_s = _drift_pairs(analyzer, skip)
+        elif preset == PAIR_MERGE:
+            from postprocessing import pair_merge as pm
+            pairs, pair_table = pm.pair_merge_pairs(analyzer, skip, stim_intervals, w_ms, r_ms,
+                                                    RP_STIM_PAD_S, RP_MAX_CONTAMINATION)
+            if len(pair_table):
+                pair_table.insert(2, 'name_a', [names.get(u, str(u)) for u in pair_table['unit_a']])
+                pair_table.insert(3, 'name_b', [names.get(u, str(u)) for u in pair_table['unit_b']])
+            pair_merge_table = pair_table
         elif preset == REDUNDANT:
             # the sorter's duplicates: units sharing most of their spikes. The presets miss
             # them -- their cross-correlogram peaks at 0 lag where a split unit's dips -- and
             # the pair passes only resolve pairs within a unit, so both copies survive.
             # Merged, the post-merge pass drops the doubled spikes, keeping the reference
             # member's copy of each (_redundant_preference); unique spikes of either stay.
-            pairs = [tuple(p) for p in sic.find_redundant_units(analyzer.sorting, **REDUNDANT_PARAMS)]
+            pairs = [tuple(p) for p in sic.find_redundant_units(analyzer.sorting, **REDUNDANT_PARAMS)
+                     if not set(p) & skip]
             max_shift = _t_c(analyzer.sampling_frequency, w_ms)
             max_cross = RP_MAX_FREE_VIOLATIONS
         else:
@@ -808,7 +1029,7 @@ def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, **job_kwar
                                                   **job_kwargs)
             if ccgs is not None:
                 analyzer.get_extension('correlograms').data['ccgs'] = ccgs
-            pairs = [tuple(p) for p in pairs]
+            pairs = [tuple(p) for p in pairs if not set(p) & skip]
             if own_score:
                 pairs, rejected = _quality_score_pairs(analyzer, pairs, w_ms, r_ms, balance)
                 for p in rejected:
@@ -816,13 +1037,25 @@ def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, **job_kwar
                                  'members': list(p), 'new_unit_id': None, 'merged': False,
                                  'reference': None,
                                  'note': 'quality score not improved by merging'})
-        groups = resolve_merging_graph(analyzer.sorting, pairs) if pairs else []
+        if preset != OUTLIERS:
+            groups = resolve_merging_graph(analyzer.sorting, pairs) if pairs else []
         # every surviving group has to pass the strict tests between *all* its members
-        # (a resolved group joins units that were only proposed through a third)
+        # (a resolved group joins units that were only proposed through a third); the
+        # outlier groups were tested as they were built
         strict = []
         for g in groups:
-            why = (_drift_merge_veto(analyzer, list(g), trains_s) if preset == DRIFT else
-                   _strict_merge_veto(analyzer, list(g), w_ms, r_ms, max_shift, max_cross))
+            if preset == OUTLIERS:
+                why = ''
+            elif preset == DRIFT:
+                why = _drift_merge_veto(analyzer, list(g), trains_s, set(map(frozenset, pairs)))
+            elif preset == PAIR_MERGE:
+                why = pm.pair_group_veto(analyzer, list(g), stim_intervals, w_ms, r_ms, RP_STIM_PAD_S,
+                                         RP_MAX_CONTAMINATION, _rp_lower_bound, RP_MAX_FREE_VIOLATIONS)
+            else:
+                # and every merged unit must pass the labels' refractory rule: DS15_20260707's
+                # redundant group 231+243+2698+2702 turned a good unit into MUA (5 violations)
+                why = (_strict_merge_veto(analyzer, list(g), w_ms, r_ms, max_shift, max_cross)
+                       or _merged_rp_veto(analyzer, list(g), w_ms, r_ms))
             if why:
                 rows.append({'preset': preset, 'group': '+'.join(map(str, g)), 'members': list(g),
                              'new_unit_id': None, 'merged': False, 'reference': None,
@@ -845,6 +1078,20 @@ def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, **job_kwar
         if not ok:
             continue
         counts = analyzer.sorting.count_num_spikes_per_unit()
+        if plot_folder is not None:
+            from postprocessing import cleaning_plots as cplots
+            for g in ok:
+                gname = '+'.join(str(names.get(u, u)) for u in g)
+                extra = list(notes.get(tuple(g), []))
+                if preset == DRIFT:
+                    extra += [_drift_pair_test(analyzer, trains_s, a, b)[1]
+                              for i, a in enumerate(g) for b in g[i + 1:]]
+                try:
+                    cplots.plot_merge_report(analyzer, g, plot_folder, f'{preset}: {gname}',
+                                             notes=extra + _group_notes(analyzer, g, names, w_ms, r_ms),
+                                             names=names, file_name=f'{preset}_{gname}')
+                except Exception as e:  # a figure never stops the cleaning
+                    print(f'    merge plot {gname} failed: {e!r}')
         analyzer, new_ids = analyzer.merge_units(ok, merging_mode='soft', censor_ms=None,
                                                  new_id_strategy='append',
                                                  return_new_unit_ids=True, format='memory',
@@ -856,7 +1103,15 @@ def auto_merge(analyzer, presets=MERGE_PRESETS, w_ms=W_MS, r_ms=R_MS, **job_kwar
             ref = max(g, key=lambda u: counts[u]) if preset == REDUNDANT else None
             rows.append({'preset': preset, 'group': '+'.join(map(str, g)), 'members': g,
                          'new_unit_id': n, 'merged': True, 'reference': ref, 'note': ''})
-    return analyzer, pd.DataFrame(rows, columns=cols)
+            names[n] = '+'.join(str(names.get(u, u)) for u in g)
+            kinds[n] = 'unit'
+    table = pd.DataFrame(rows, columns=cols)
+    table['names'] = ['+'.join(str(names.get(u, u)) for u in m) for m in table['members']]
+    if outlier_table is not None:
+        table.attrs['outlier_clusters'] = outlier_table
+    if pair_merge_table is not None:
+        table.attrs['pair_merge'] = pair_merge_table
+    return analyzer, table
 
 
 def _redundant_preference(before, merged, merged_ids, merges):
@@ -1136,7 +1391,7 @@ def _resolve_merged_pairs(a1, a2, merges, merged_ids, map1, stim_intervals, meth
 
 
 def _metrics_and_labels(a3, sim_params, loc_params, tm_params, w_ms, r_ms, bombcell_thresholds,
-                        **job_kwargs):
+                        stim_intervals=None, **job_kwargs):
     """Template-derived extensions and censored quality metrics for every unit, then labels.
 
     Merged units' templates were reset by the thinning, and the merge search leaves an l1
@@ -1154,7 +1409,7 @@ def _metrics_and_labels(a3, sim_params, loc_params, tm_params, w_ms, r_ms, bombc
                    delete_existing_metrics=False, **job_kwargs)
     qm_params = a3.get_extension('quality_metrics').params['metric_params']
     assert qm_params['rp_violation']['censored_period_ms'] == w_ms, qm_params['rp_violation']
-    return _bombcell_with_rp_minimum(a3, bombcell_thresholds)
+    return _bombcell_with_rp_minimum(a3, bombcell_thresholds, stim_intervals=stim_intervals)
 
 
 def _extension_params(analyzer, name):
@@ -1203,7 +1458,7 @@ def merge_redundant_units(analyzer, stim_intervals=None, method='template', w_ms
     print('redundant units: quality metrics and bombcell')
     labels = _metrics_and_labels(a3, params['template_similarity'], params['unit_locations'],
                                  params['template_metrics'], w_ms, r_ms, bombcell_thresholds,
-                                 **job_kwargs)
+                                 stim_intervals=stim_intervals, **job_kwargs)
     a3.sorting.set_property('bombcell_label', labels.loc[a3.unit_ids, 'bombcell_label'].values)
     ks = _trace_ks_units(list(a3.unit_ids), [{}, map2], merges,
                          origin={u: str(n) for u, n in names.items()})
@@ -1235,19 +1490,36 @@ def clean_and_curate(analyzer, stim_intervals=None, method='template', w_ms=W_MS
                      plots=True, previous_labels=None, **job_kwargs):
     """The whole post-sort cleaning; returns (analyzer_clean, analyzer_curated, report).
 
+    1. every unit of the sort is scored (score_outliers; noise units too)
+    2. greedy splitting and outlier peeling (greedy_cleaning.greedy_split_and_peel): peeled
+       outliers become '<unit>/out<k>' clusters, light artifacts '<unit>/art', spikes with an
+       undefined feature '<unit>/nan'
+    3. the noise units (bombcell's waveform-shape test) are found, and kept out of the merges
+    4. close pairs <= W within each unit; the '/nan' clusters go (their features would break
+       the merge search)
+    5. merges: outlier clusters into the neighbour they match, then the presets (incl.
+       PAIR_MERGE: pieces of one neuron, merged when presence rises without an SNR cost), each
+       merge drawn to merge_plots/; PAIR_MERGE's evidence -> pair_merge_candidates.csv
+    6. close pairs in the merged units; the '/art' clusters go (small outlier clusters are
+       judged by their shape in step 7)
+    6b. double detections across units deleted from one side per pair (DELETE_DOUBLE_DETECTIONS;
+       pair_merge.double_detections) -> double_detections.csv
+    7. metrics and bombcell labels for every unit left
+
     analyzer        : the analyzer of the sort (never modified; everything is in memory)
-    stim_intervals  : (n, 2) seconds of stimulation, for the outlier scorer's core fit
+    stim_intervals  : (n, 2) seconds of every light pulse: the scorer's core fit leaves them
+                      out, and the light artifacts are looked for at their edges
     method          : 'template' resolves close pairs by fit, 'order' by keep-first --
                       the control arm, identical otherwise
     outlier_result  : score_outliers(analyzer, ...) if already computed
-    stim_outliers   : 'drop' (outliers during stimulation removed too) or 'keep'
+    stim_outliers   : 'drop' (outliers during stimulation peeled too) or 'keep'
     previous_labels : {Kilosort unit: label from an earlier curation}, for the
                       before/after columns of unit_labels.csv
-    plots           : with audit_folder, write a figure per unit of its removed spikes
-                      (removed_spike_plots/) and per bimodal split (bimodal_split_plots/)
+    plots           : with audit_folder, review figures of every split, peel and merge
     analyzer_clean  : the non-noise units; analyzer_curated: every unit, with labels
     report          : dict of stage counts; the tables go to audit_folder if given
     """
+    from postprocessing import greedy_cleaning as gc
     assert method in ('template', 'order')
     assert stim_outliers in ('drop', 'keep')
     fs = analyzer.sampling_frequency
@@ -1258,195 +1530,225 @@ def clean_and_curate(analyzer, stim_intervals=None, method='template', w_ms=W_MS
     folder = Path(audit_folder) if audit_folder is not None else None
     if folder is not None:
         folder.mkdir(parents=True, exist_ok=True)
+    plot_folder = folder if (plots and folder is not None) else None
+    input_analyzer = analyzer
+    # recomputed for every unit after the splits (a split's partial recompute leaves NaNs in
+    # the new units' template metrics, and the resampled templates move their locations),
+    # and again in step 7: the similarity_correlograms preset leaves an l1 similarity behind
+    sim_params, loc_params, tm_params = (_extension_params(analyzer, n) for n in
+                                         ('template_similarity', 'unit_locations', 'template_metrics'))
 
-    # 1. outliers -- scored on the sort as it came, every unit
-    print('spike cleaning 1/5: scoring outlier spikes')
+    # 1-2. scores of every unit, then greedy splits and peels
+    print('spike cleaning 1/7: scoring outlier spikes')
     result = (outlier_result if outlier_result is not None else
               score_outliers(analyzer, stim_intervals, **job_kwargs))
-    # 0. units that are two separate clusters become two units, re-scored as such; from
-    # here on `analyzer` is the split one, and its new units are named 'parent/k'
-    input_analyzer = analyzer
-    analyzer, result, split_table, origin, split_levels = split_bimodal_units(
-        analyzer, result, stim_intervals, **job_kwargs)
-    splits, outlier_audit, scores = result
-    report['bimodal_splits'] = len(split_table)
-    report['bimodal_split_units'] = split_table['unit'].tolist() if len(split_table) else []
+    print('spike cleaning 2/7: greedy splitting and outlier peeling')
+    analyzer, st, split_table, peel_table, art_table = gc.greedy_split_and_peel(
+        analyzer, result, stim_intervals, stim_outliers, plot_folder=plot_folder, **job_kwargs)
+    origin, kinds, scores = dict(st.name), dict(st.kind), st.scores
+    for name, params in (('unit_locations', loc_params), ('template_similarity', sim_params),
+                         ('template_metrics', tm_params)):
+        if params is not None:
+            analyzer.compute(name, **copy.deepcopy(params), **job_kwargs)
+    done = split_table[split_table['children'].map(len) > 0] if len(split_table) else split_table
+    peeled = peel_table[peel_table['note'] == ''] if len(peel_table) else peel_table
+    report.update({
+        'bimodal_splits': len(done),
+        'bimodal_split_units': done['unit'].tolist() if len(done) else [],
+        'split_depth_capped': int((split_table['note'] != '').sum()) if len(split_table) else 0,
+        'peel_rounds': int(peeled['round'].max()) if len(peeled) else 0,
+        'units_peeled': int(peeled['unit'].nunique()) if len(peeled) else 0,
+        'outlier_spikes_peeled': int(peeled['outliers'].sum()) if len(peeled) else 0,
+        'peel_capped': int(peel_table['note'].str.startswith('cap').sum()) if len(peel_table) else 0,
+        'round_capped': int(peel_table['note'].str.startswith('round cap').sum()) if len(peel_table) else 0,
+        'outlier_clusters': sum(1 for k in kinds.values() if k == 'out'),
+        'light_artifacts': int(art_table['artifacts'].sum()) if len(art_table) else 0,
+        'units_with_light_artifacts': int((art_table['artifacts'] > 0).sum()) if len(art_table) else 0,
+        'n_units_after_peeling': len(analyzer.unit_ids)})
+    print(f"  {report['bimodal_splits']} splits, {report['outlier_spikes_peeled']} outliers peeled "
+          f"from {report['units_peeled']} units in {report['peel_rounds']} rounds, "
+          f"{report['outlier_clusters']} outlier clusters, {report['light_artifacts']} light artifacts")
 
-    # 0b. noise units go now. Bombcell's noise test is on the waveform shape, which no
-    # removal of outlier spikes or merge can turn into a neuron's; whatever real signal
-    # a noise unit carried as a separate cluster has just been split off above.
-    # Cleaning them further would only spend time -- and merge candidates -- on units
-    # that are thrown out at the end anyway.
-    if split_levels and input_analyzer.has_extension('template_metrics'):
-        # the split's partial recompute leaves NaNs in the new halves' template metrics,
-        # and the noise test fails a unit on any NaN; the split analyzer is in memory
-        analyzer.compute('template_metrics',
-                         **copy.deepcopy(input_analyzer.get_extension('template_metrics').params),
-                         **job_kwargs)
-    pre_noise = analyzer
+    # 3. noise units: found now and kept out of the merges; whether they are noise in the end
+    # is decided on the final metrics
+    print('spike cleaning 3/7: noise units')
     noise_table = _noise_units(analyzer, bombcell_thresholds, origin)
-    noise_ids = noise_table['unit_id'].tolist() if len(noise_table) else []
-    report['noise_units_dropped'] = len(noise_ids)
-    counts_in = analyzer.sorting.count_num_spikes_per_unit()
-    report['noise_unit_spikes_dropped'] = int(sum(counts_in[u] for u in noise_ids))
-    if noise_ids:
-        analyzer = select_units_aligned(analyzer, [u for u in analyzer.unit_ids if u not in set(noise_ids)])
-        scores = {u: s for u, s in scores.items() if u not in set(noise_ids)}
-        splits = {u: s for u, s in splits.items() if u not in set(noise_ids)}
-        outlier_audit = outlier_audit.drop(index=[u for u in noise_ids if u in outlier_audit.index])
-    # restored after the merges: the similarity_correlograms preset recomputes
-    # template_similarity with its own method (l1) and leaves it on the analyzer
-    sim_params = (dict(analyzer.get_extension('template_similarity').params)
-                  if analyzer.has_extension('template_similarity') else None)
-    # and template_metrics are recomputed whole in step 5: the split's partial recompute
-    # of the changed units leaves their multi-channel 'spread' NaN
-    tm_params = (copy.deepcopy(analyzer.get_extension('template_metrics').params)
-                 if analyzer.has_extension('template_metrics') else None)
-    loc_params = (copy.deepcopy(analyzer.get_extension('unit_locations').params)
-                  if analyzer.has_extension('unit_locations') else None)
-    pre_drops = {u: np.asarray(sp[1], dtype=np.int64) for u, sp in splits.items()}
-    # NaN-feature spikes go from every unit, accepted split or not
-    for u, sc in scores.items():
-        nan_idx = np.flatnonzero(sc['nan'])
-        if nan_idx.size:
-            pre_drops[u] = np.union1d(pre_drops.get(u, []), nan_idx).astype(np.int64)
-    report['nan_feature_spikes_dropped'] = int(sum(int(np.sum(sc['nan'])) for sc in scores.values()))
-    # Spikes fired during stimulation are scored against the unit's spontaneous core
-    # like any other; the scorer leaves them out of its own outlier set so that they can
-    # neither define the core nor sway the split decision. Here, stim_outliers='drop'
-    # removes those beyond the same cut -- light artifacts and foreign spikes -- in
-    # every unit whose core can be trusted: fitted (d2 exists) and not rejected as a
-    # noise core, a second population or too small. 'keep' leaves them all. The cost
-    # to watch: an evoked spike of this unit that overlaps a co-activated neighbour
-    # also scores far out, so the audit counts the evoked spikes each unit loses.
-    untrusted = ('REVIEW', 'outlier share', 'too few spikes')
-    stim_dropped = {}
-    if stim_outliers == 'drop':
-        reasons = outlier_audit['reason'].astype(str)
-        for u, sc in scores.items():
-            if sc['d2'] is None or reasons.get(u, '').startswith(untrusted):
-                continue
-            idx = np.flatnonzero((sc['d2'] > sc['cut']) & sc['stim'] & ~sc['nan'])
-            if idx.size:
-                stim_dropped[u] = int(idx.size)
-                pre_drops[u] = np.union1d(pre_drops.get(u, []), idx).astype(np.int64)
-    outlier_audit = outlier_audit.assign(
-        n_stim_spikes=[int(np.sum(scores[u]['stim'])) if u in scores else 0 for u in outlier_audit.index],
-        stim_outliers_dropped=[stim_dropped.get(u, 0) for u in outlier_audit.index])
-    report['stim_outliers'] = stim_outliers
-    report['stim_outliers_dropped'] = int(sum(stim_dropped.values()))
-    report['outliers_dropped'] = int(sum(len(v) for v in pre_drops.values()))
-    report['units_with_outliers_dropped'] = len(pre_drops)
-    reasons = outlier_audit['reason'].astype(str)
-    # left whole, and worth a look: a second population, or a core that is not the unit
-    report['units_over_outlier_share'] = outlier_audit.index[reasons.str.startswith('outlier share')].tolist()
-    report['units_for_review'] = outlier_audit.index[reasons.str.startswith('REVIEW')].tolist()
+    noise_ids = set(noise_table['unit_id']) if len(noise_table) else set()
+    nan_ids = [u for u in analyzer.unit_ids if kinds[u] == 'nan']
+    art_ids = {u for u in analyzer.unit_ids if kinds[u] == 'art'}
+    report['noise_units_before_merging'] = len(noise_ids)
 
-    # 2. refractory pairs among what is left, pre-merge, then one split for both
-    print(f'spike cleaning 2/5: resolving pairs <= {w_ms:g} ms ({method})')
-    pair_drops, pairs_pre = _pair_drops(analyzer, scores, t_c, method, exclude=pre_drops)
+    # 4. refractory pairs within every unit but the '/nan' clusters, which go now. The '/art'
+    # clusters too: an artifact can be detected twice at one light edge, and step 6 checks that
+    # no unit holds a close pair before it drops them
+    print(f'spike cleaning 4/7: resolving pairs <= {w_ms:g} ms ({method})')
+    pair_drops, pairs_pre = _pair_drops(analyzer, scores, t_c, method,
+                                        unit_ids=[u for u in analyzer.unit_ids if kinds[u] != 'nan'])
     report['pairs_dropped_pre_merge'] = int(pairs_pre['dropped'].sum())
-    all_drops = {u: np.union1d(pre_drops.get(u, []), pair_drops.get(u, [])).astype(np.int64)
-                 for u in set(pre_drops) | set(pair_drops)}
-    # every removed spike, by (input unit, sample) and why: the audit and the plots
     in_samples = _unit_samples(analyzer)
-    removed = []
-    for u in all_drops:
-        nan = np.flatnonzero(scores[u]['nan']) if u in scores else np.array([], int)
-        groups = (('nan feature', nan),
-                  ('outlier', np.setdiff1d(splits[u][1], nan) if u in splits else []),
-                  ('stim outlier', np.setdiff1d(pre_drops.get(u, []),
-                                                np.union1d(nan, splits[u][1] if u in splits else []))),
-                  ('close pair (pre-merge)', pair_drops.get(u, [])))
-        for why, idx in groups:
-            idx = np.asarray(idx, dtype=np.int64)
-            if idx.size:
-                removed.append(pd.DataFrame({'unit': u, 'sample': in_samples[u][idx], 'reason': why}))
-    a1, map1 = drop_spikes(analyzer, all_drops, **job_kwargs)
-    if a1 is analyzer:
-        # nothing dropped; the merges below modify their input's extensions in memory
-        a1 = analyzer.save_as(format='memory')
+    removed = [pd.DataFrame({'unit': u, 'sample': in_samples[u][idx], 'reason': 'close pair (pre-merge)'})
+               for u, idx in pair_drops.items()]
+    removed += [pd.DataFrame({'unit': u, 'sample': in_samples[u], 'reason': 'nan feature'}) for u in nan_ids]
+    a1, map1 = drop_spikes(analyzer, pair_drops, **job_kwargs)
+    # a fresh analyzer either way: the merges modify their input's extensions in memory
+    a1 = select_units_aligned(a1, [u for u in a1.unit_ids if u not in set(nan_ids)])
+    names1 = {map1.get(u, u): origin[u] for u in analyzer.unit_ids if u not in set(nan_ids)}
+    kinds1 = {map1.get(u, u): kinds[u] for u in analyzer.unit_ids if u not in set(nan_ids)}
+    exclude1 = {map1.get(u, u) for u in noise_ids | art_ids}
 
-    # 3. merges
-    print('spike cleaning 3/5: merging')
-    a2, merges = auto_merge(a1, merge_presets, w_ms, r_ms, **job_kwargs)
+    # 5. merges
+    print('spike cleaning 5/7: merging')
+    a2, merges = auto_merge(a1, merge_presets, w_ms, r_ms, exclude=exclude1, names=names1,
+                            kinds=kinds1, plot_folder=(plot_folder / 'merge_plots'
+                                                       if plot_folder is not None else None),
+                            stim_intervals=stim_intervals, **job_kwargs)
+    outlier_table = merges.attrs.pop('outlier_clusters', None)
+    pair_merge_table = merges.attrs.pop('pair_merge', None)
     merged_ids = merges.loc[merges['merged'], 'new_unit_id'].tolist() if len(merges) else []
     # a later preset can merge a unit made by an earlier one; only the survivors exist
     merged_ids = [u for u in merged_ids if u in list(a2.unit_ids)]
     report['merges'] = int(merges['merged'].sum()) if len(merges) else 0
+    report['merges_by_preset'] = (merges[merges['merged'].astype(bool)]['preset'].value_counts().to_dict()
+                                  if len(merges) else {})
     if merged_ids:
         _thin_merged_random_spikes(a1, a2, merged_ids, merges)
 
-    # 4. refractory pairs again, merged units only, re-scored on the merged analyzer
-    print(f'spike cleaning 4/5: resolving pairs in {len(merged_ids)} merged units')
+    # 6. refractory pairs again, merged units only, re-scored on the merged analyzer; then
+    # the artifact clusters go (small outlier clusters are judged by their shape in step 7)
+    print(f'spike cleaning 6/7: resolving pairs in {len(merged_ids)} merged units')
     a3, map2, pairs_post, post_removed = _resolve_merged_pairs(
         a1, a2, merges, merged_ids, map1, stim_intervals, method, t_c, **job_kwargs)
     removed.extend(post_removed)
     report['pairs_dropped_post_merge'] = int(pairs_post['dropped'].sum()) if len(pairs_post) else 0
-
-    # 5. metrics for every unit with the censored refractory params, then bombcell
-    print('spike cleaning 5/5: quality metrics and bombcell')
-    labels = _metrics_and_labels(a3, sim_params, loc_params, tm_params, w_ms, r_ms,
-                                 bombcell_thresholds, **job_kwargs)
-    a3.sorting.set_property('bombcell_label', labels.loc[a3.unit_ids, 'bombcell_label'].values)
     ks = _trace_ks_units(list(a3.unit_ids), [map1, map2], merges, origin)
+    counts3 = a3.sorting.count_num_spikes_per_unit()
+    inv1 = {new: old for old, new in map1.items()}
+    junk = {}
+    for u in a3.unit_ids:
+        n = str(ks[u])
+        if '+' not in n and n.endswith('/art'):
+            junk[u] = 'light artifact'
+    small_out = {u for u in a3.unit_ids if '+' not in str(ks[u]) and '/out' in str(ks[u])
+                 and u not in junk and counts3[u] < OUTLIER_KEEP_MIN_SPIKES}
+    s3 = _unit_samples(a3)
+    removed += [pd.DataFrame({'unit': inv1.get(u, u), 'sample': s3[u], 'reason': why})
+                for u, why in junk.items()]
+    a4 = select_units_aligned(a3, [u for u in a3.unit_ids if u not in junk])
+
+    # 6b. spikes detected by two units: the copy whose unit's template explains it worse goes,
+    # one side per pair (pair_merge.double_detections); the units involved are re-scored against
+    # their final templates for it. A unit made only of copies goes whole.
+    dd_table = pd.DataFrame()
+    if DELETE_DOUBLE_DETECTIONS:
+        from postprocessing import pair_merge as pm
+        print('spike cleaning 6b/7: double detections across units')
+
+        def score_fn(unit_ids):
+            return sos.find_outlier_spikes(a4, unit_ids=unit_ids, stim_intervals=stim_intervals,
+                                           return_scores=True, **job_kwargs)[2]
+        dd_drops, dd_whole, dd_table = pm.double_detections(a4, stim_intervals, ks, score_fn)
+        s4 = _unit_samples(a4)
+        removed += [pd.DataFrame({'unit': u, 'sample': s4[u][idx], 'reason': 'double detection',
+                                  'ks_name': ks[u]}) for u, idx in dd_drops.items()]
+        removed += [pd.DataFrame({'unit': u, 'sample': s4[u], 'reason': 'double detection (whole unit)',
+                                  'ks_name': ks[u]}) for u in dd_whole]
+        if dd_whole:
+            a4 = select_units_aligned(a4, [u for u in a4.unit_ids if u not in set(dd_whole)])
+        if dd_drops:
+            a4, map3 = drop_spikes(a4, dd_drops, **job_kwargs)
+            a4 = select_units_aligned(a4, list(a4.unit_ids))
+            ks = {map3.get(u, u): n for u, n in ks.items() if u not in set(dd_whole)}
+            small_out = {map3.get(u, u) for u in small_out if u not in set(dd_whole)}
+        report.update({'double_detection_pairs': len(dd_table),
+                       'double_detection_spikes': int(sum(len(i) for i in dd_drops.values())),
+                       'double_detection_units_removed': len(dd_whole)})
+
+    # 7. metrics for every unit with the censored refractory params, then bombcell
+    print('spike cleaning 7/7: quality metrics and bombcell')
+    labels = _metrics_and_labels(a4, sim_params, loc_params, tm_params, w_ms, r_ms,
+                                 bombcell_thresholds, stim_intervals=stim_intervals, **job_kwargs)
+    # a small outlier cluster stays when its shape passes the noise criteria (bombcell has just
+    # judged it) or when it is too small for its template to be judged: noise -> mua
+    counts_a4 = a4.sorting.count_num_spikes_per_unit()
+    too_small = [u for u in small_out if u in labels.index and counts_a4[u] < OUTLIER_EVAL_MIN_SPIKES
+                 and labels.loc[u, 'bombcell_label'] == 'noise']
+    labels.loc[too_small, 'bombcell_label'] = 'mua'
+    report['small_outlier_clusters'] = len(small_out)
+    report['small_outlier_clusters_too_small_kept'] = len(too_small)
+    report['small_outlier_clusters_noise'] = int(sum(labels.loc[u, 'bombcell_label'] == 'noise'
+                                                     for u in small_out if u in labels.index))
+    a4.sorting.set_property('bombcell_label', labels.loc[a4.unit_ids, 'bombcell_label'].values)
     # a string property set after the last merge; merges blank disagreeing strings
-    a3.sorting.set_property('ks_unit_ids', np.array([ks[u] for u in a3.unit_ids]))
-    keep = [u for u in a3.unit_ids if labels.loc[u, 'bombcell_label'] != 'noise']
-    clean = select_units_aligned(a3, keep)
+    a4.sorting.set_property('ks_unit_ids', np.array([ks[u] for u in a4.unit_ids]))
+    keep = [u for u in a4.unit_ids if labels.loc[u, 'bombcell_label'] != 'noise']
+    clean = select_units_aligned(a4, keep)
     removed = (pd.concat(removed, ignore_index=True) if removed else
                pd.DataFrame(columns=['unit', 'sample', 'reason']))
-    # the Kilosort unit (or split half) each removed spike came from, by name
+    # the Kilosort unit (or split part, or cluster) each removed spike came from, by name
     removed['ks_unit'] = [origin.get(u, str(u)) for u in removed['unit']]
-    report.update({'n_units_out': len(a3.unit_ids), 'n_units_clean': len(keep),
-                   'n_spikes_out': int(a3.sorting.to_spike_vector().size),
+    if 'ks_name' in removed.columns:  # step 6b's rows name their (merged, renamed) units themselves
+        has = removed['ks_name'].notna()
+        removed.loc[has, 'ks_unit'] = removed.loc[has, 'ks_name']
+        removed = removed.drop(columns='ks_name')
+    final_noise = [u for u in a4.unit_ids if labels.loc[u, 'bombcell_label'] == 'noise']
+    counts4 = a4.sorting.count_num_spikes_per_unit()
+    report.update({'n_units_out': len(a4.unit_ids), 'n_units_clean': len(keep),
+                   'n_spikes_out': int(a4.sorting.to_spike_vector().size),
+                   'noise_units_dropped': len(final_noise),
+                   'noise_unit_spikes_dropped': int(sum(counts4[u] for u in final_noise)),
+                   'outliers_dropped': int(removed['reason'].isin(
+                       ['light artifact', 'small outlier cluster', 'nan feature']).sum()),
+                   'outlier_clusters_kept': sum(1 for u in a4.unit_ids if '/out' in str(ks[u])
+                                                and '+' not in str(ks[u])),
                    'labels': labels['bombcell_label'].value_counts().to_dict(),
                    'rp_demoted': int(labels['rp_demoted'].sum()),
                    'removed_by_reason': removed['reason'].value_counts().to_dict()})
-    # every spike accounted for: what went in is what came out, plus what was removed
-    # spike by spike, plus the noise units dropped whole
-    assert (report['n_spikes_in'] - report['n_spikes_out']
-            == len(removed) + report['noise_unit_spikes_dropped']), \
-        (report['n_spikes_in'], report['n_spikes_out'], len(removed), report['noise_unit_spikes_dropped'])
+    # every spike accounted for: what went in is what came out plus what was removed
+    assert report['n_spikes_in'] - report['n_spikes_out'] == len(removed), \
+        (report['n_spikes_in'], report['n_spikes_out'], len(removed))
 
     if folder is not None:
-        outlier_audit.to_csv(folder / 'outlier_audit.csv')
+        st.audit.to_csv(folder / 'outlier_audit.csv')
         pairs_pre.to_csv(folder / 'pairs_pre_merge.csv')
         pairs_post.to_csv(folder / 'pairs_post_merge.csv')
         merges.to_csv(folder / 'merges.csv', index=False)
         removed.to_csv(folder / 'removed_spikes.csv', index=False)
-        pd.DataFrame({'unit_id': list(a3.unit_ids), 'ks_unit_ids': [ks[u] for u in a3.unit_ids],
-                      'bombcell_label': labels.loc[a3.unit_ids, 'bombcell_label'].values,
-                      'rp_violations': labels.loc[a3.unit_ids, 'rp_violations'].values,
-                      'rp_contamination': labels.loc[a3.unit_ids, 'rp_contamination'].values,
-                      'rp_contamination_lo': labels.loc[a3.unit_ids, 'rp_contamination_lo'].values,
-                      'rp_counted': labels.loc[a3.unit_ids, 'rp_counted'].values,
-                      'rp_demoted': labels.loc[a3.unit_ids, 'rp_demoted'].values}
+        split_table.to_csv(folder / 'bimodal_splits.csv', index=False)
+        peel_table.to_csv(folder / 'peels.csv', index=False)
+        art_table.to_csv(folder / 'light_artifacts.csv', index=False)
+        if outlier_table is not None:
+            outlier_table.to_csv(folder / 'outlier_clusters.csv', index=False)
+        if pair_merge_table is not None:
+            pair_merge_table.to_csv(folder / 'pair_merge_candidates.csv', index=False)
+        dd_table.to_csv(folder / 'double_detections.csv', index=False)
+        noise_final = _noise_units(a4, bombcell_thresholds, ks)
+        if len(noise_final):  # the small outlier clusters kept as too small to judge are not noise
+            noise_final = noise_final[~noise_final['unit_id'].isin(too_small)]
+        noise_final.to_csv(folder / 'noise_units.csv', index=False)
+        pd.DataFrame({'unit_id': list(a4.unit_ids), 'ks_unit_ids': [ks[u] for u in a4.unit_ids],
+                      'bombcell_label': labels.loc[a4.unit_ids, 'bombcell_label'].values,
+                      'rp_violations': labels.loc[a4.unit_ids, 'rp_violations'].values,
+                      'rp_contamination': labels.loc[a4.unit_ids, 'rp_contamination'].values,
+                      'rp_contamination_lo': labels.loc[a4.unit_ids, 'rp_contamination_lo'].values,
+                      'rp_counted': labels.loc[a4.unit_ids, 'rp_counted'].values,
+                      'rp_demoted': labels.loc[a4.unit_ids, 'rp_demoted'].values}
                      ).to_csv(folder / 'unit_ids.csv', index=False)
         (folder / 'report.json').write_text(json.dumps(report, indent=2, default=str))
-        if len(split_table):
-            split_table.to_csv(folder / 'bimodal_splits.csv', index=False)
-        if len(noise_table):
-            noise_table.to_csv(folder / 'noise_units_dropped.csv', index=False)
         kl = input_analyzer.sorting.get_property('KSLabel')
-        label_table(a3, labels, ks, bombcell_thresholds, previous_labels,
-                    dict(zip(input_analyzer.unit_ids, kl)) if kl is not None else None,
-                    noise_table).to_csv(folder / 'unit_labels.csv', index=False)
+        label_table(a4, labels, ks, bombcell_thresholds, previous_labels,
+                    dict(zip(input_analyzer.unit_ids, kl)) if kl is not None else None
+                    ).to_csv(folder / 'unit_labels.csv', index=False)
         if plots:
             from postprocessing import cleaning_plots as cplots
-            # each pre-merge unit's final label, found through its name in ks_unit_ids
+            # each unit's final label, found through its name in ks_unit_ids
             final_of = {name: labels.loc[u, 'bombcell_label']
-                        for u in a3.unit_ids for name in str(ks[u]).split('+')}
-            labels_by_unit = {u: final_of.get(origin.get(u, str(u)), '')
-                              for u in analyzer.unit_ids}
-            cplots.plot_removed_spikes(analyzer, removed, folder / 'removed_spike_plots',
-                                       labels=labels_by_unit, names=origin, **job_kwargs)
-            if noise_ids:
-                cplots.plot_noise_units(pre_noise, noise_table, folder / 'noise_unit_plots',
-                                        **job_kwargs)
-            for level_analyzer, labels_by_parent in split_levels:
-                cplots.plot_bimodal_splits(level_analyzer, labels_by_parent,
-                                           folder / 'bimodal_split_plots',
-                                           names={**{u: str(u) for u in input_analyzer.unit_ids},
-                                                  **origin}, table=split_table)
-    return clean, a3, report
+                        for u in a4.unit_ids for name in str(ks[u]).split('+')}
+            pairs_only = removed[removed['reason'].str.startswith('close pair')]
+            if len(pairs_only):
+                cplots.plot_removed_spikes(analyzer, pairs_only, folder / 'removed_spike_plots',
+                                           labels={u: final_of.get(origin.get(u, str(u)), '')
+                                                   for u in analyzer.unit_ids},
+                                           names=origin, **job_kwargs)
+            if len(noise_final):
+                cplots.plot_noise_units(a4, noise_final, folder / 'noise_unit_plots', **job_kwargs)
+    return clean, a4, report

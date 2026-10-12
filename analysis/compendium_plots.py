@@ -31,6 +31,36 @@ def load_sessions(ana_folders):
     return [load_session(folders) for folders in ana_folders]
 
 
+def plot_rainbows(ephys, binary_signals, trial_events, comp_folder):
+    """The cue-aligned lick-latency ("rainbow") figures, each trial cut at its first lick."""
+    pu.plot_spn_summary(
+        ephys, binary_signals, trial_events,
+        save_path=comp_folder / 'spn_summary.png',
+        ms_censored=500,
+        n_quintiles=7,
+    )
+    pu.plot_cue_aligned_nostim(
+        ephys, binary_signals, trial_events, n_quintiles=10,
+        save_path=comp_folder / 'cue_aligned_nostim.png', ms_censored=50
+    )
+    pu.plot_spn_cue_aligned_nostim(
+        ephys, binary_signals, trial_events, n_quintiles=6,
+        save_path=comp_folder / 'spn_cue_aligned_nostim.png', ms_censored=1000
+    )
+    pu.plot_dspn_isPN_diff(
+        ephys, binary_signals, trial_events,
+        save_path=comp_folder / 'dspn_ispn_diff.png',
+        n_quintiles=10, ms_censored=1000
+    )
+
+
+def replot_rainbows(sessions, comp_folder):
+    """Redraw only the rainbow figures of an existing compendium (see plot_rainbows)."""
+    ephys, binary_signals, trial_events = pu.merge_sessions(sessions)
+    plot_rainbows(ephys, binary_signals, trial_events, Path(comp_folder))
+    plt.close('all')
+
+
 def plot_compendium(sessions, ana_folders, comp_folder):
     """Every compendium plot of the given sessions, merged into one pseudo-session, into comp_folder.
 
@@ -57,16 +87,16 @@ def plot_compendium(sessions, ana_folders, comp_folder):
         save_path=comp_folder / 'firing_rate_by_category'
     )
 
+    # the binned rates (pu.BIN_WIDTH) every z-score is computed from, per unit
+    pu.plot_binned_rate_distributions(
+        ephys, binary_signals, trial_events,
+        save_path=comp_folder / 'binned_rate_distributions.png'
+    )
+
     # --- plots ---
     pu.plot_spn_lick_bout_psth(ephys, binary_signals, trial_events, comp_folder /
                                 "lick_bout_psth")
 
-    pu.plot_spn_summary(
-        ephys, binary_signals, trial_events,
-        save_path=comp_folder / 'spn_summary.png',
-        ms_censored=500,
-        n_quintiles=7,
-    )
 
     pu.plot_outcome_heatmap_nostim(
         ephys, binary_signals, trial_events,
@@ -99,15 +129,7 @@ def plot_compendium(sessions, ana_folders, comp_folder):
         clim=(0, None), zscore=False,
     )
 
-    pu.plot_cue_aligned_nostim(
-        ephys, binary_signals, trial_events, n_quintiles=10,
-            save_path=comp_folder / 'cue_aligned_nostim.png', ms_censored=50
-    )
-
-    pu.plot_spn_cue_aligned_nostim(
-        ephys, binary_signals, trial_events, n_quintiles=6,
-        save_path=comp_folder / 'spn_cue_aligned_nostim.png', ms_censored=1000
-    )
+    plot_rainbows(ephys, binary_signals, trial_events, comp_folder)
 
     pu.plot_spn_mean_psth(
         ephys, binary_signals, trial_events,
@@ -128,12 +150,6 @@ def plot_compendium(sessions, ana_folders, comp_folder):
 
 
 
-    pu.plot_dspn_isPN_diff(
-        ephys, binary_signals, trial_events,
-        save_path=comp_folder / 'dspn_ispn_diff.png',
-        n_quintiles=10, ms_censored=1000
-    )
-
     fig, summary = pu.plot_dspn_ispn_lick_bout_bar(
         ephys, binary_signals, trial_events,
         save_path=comp_folder / "dspn_ispn_lick_bout_bar"
@@ -153,7 +169,7 @@ if __name__ == "__main__":
     #save_folder = fs.category_path(subj_folder, fs.ANALYSIS_ROOT) / "compendium"
     #ana_folder = Path(r"C:\Users\assad\Desktop\experiment_data\analysis_files")
     # every dataset now lives on D: (DS48 moved from C: on 2026-10-02)
-    ana_folder = Path(r"D:\experiment_data\analysis_files")
+    ana_folder = Path(r"C:\experiment_data\analysis_files")
     comp_folder = ana_folder / "compendium"
 
     ana_folders = [ana_folder / s.split('_')[0] / s for s in (
